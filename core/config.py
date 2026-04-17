@@ -5,9 +5,9 @@ from dataclasses import dataclass
 @dataclass
 class LLMConfig:
     """LLM 客户端配置"""
-    # 支持 openai / github_copilot
+    # 支持 openai / github_copilot / qwen
     provider: str = "openai"
-    model: str = "gpt-4o"
+    model: str = ""  # 如果为空，根据 provider 选择默认模型
     temperature: float = 0.2
     max_tokens: int = 4096
     # API key 从环境变量读取，不在代码中硬写
@@ -15,6 +15,16 @@ class LLMConfig:
     base_url: str = ""
 
     def __post_init__(self):
+        # 如果未指定模型，根据 provider 选择默认值
+        if not self.model:
+            if self.provider == "openai":
+                self.model = "gpt-4o"
+            elif self.provider == "github_copilot":
+                self.model = "gpt-4"
+            elif self.provider == "qwen":
+                self.model = "qwen-max"
+        
+        # 读取 API key
         if not self.api_key:
             if self.provider == "openai":
                 self.api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -22,6 +32,8 @@ class LLMConfig:
                 self.api_key = os.environ.get("GITHUB_TOKEN", "")
             elif self.provider == "qwen":
                 self.api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        
+        # 设置 base_url
         if not self.base_url:
             if self.provider == "github_copilot":
                 self.base_url = "https://api.githubcopilot.com"

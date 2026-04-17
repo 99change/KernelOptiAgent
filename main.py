@@ -4,8 +4,14 @@ GPU Kernel 优化 Agent 主入口
 
 用法：
     python main.py --input examples/vector_add.cu
+    python main.py --input examples/vector_add.cu --provider qwen --model qwen-max
     python main.py --input examples/vector_add.cu --mock     # 无 GPU 时使用 mock 模式
     python main.py --input examples/vector_add.cu --rounds 3 # 限制优化轮数
+    
+环境变量：
+    export OPENAI_API_KEY=sk-xxx                             # OpenAI
+    export DASHSCOPE_API_KEY=sk-xxx                          # Qwen (阿里云)
+    export GITHUB_TOKEN=ghp_xxx                              # GitHub Copilot
 """
 
 import os
@@ -37,7 +43,7 @@ def setup_logging(verbose: bool = False):
 # 核心流程
 # ─────────────────────────────────────────────
 
-def run(kernel_code: str, mock: bool = False, max_rounds: int = 5) -> OptimizationReport:
+def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: LLMConfig = None) -> OptimizationReport:
     """
     主优化流程：分析 → 测评 → 优化 → 返回报告
 
@@ -45,10 +51,14 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5) -> Optimizati
         kernel_code: 输入的 CUDA kernel 源代码
         mock: True 则跳过真实 GPU 编译，使用模拟测评
         max_rounds: 最大优化策略尝试次数
+        llm_config: LLM 配置对象（如不提供则使用全局 LLM_CONFIG）
 
     Returns:
         OptimizationReport 包含优化后代码和所有过程数据
     """
+    if llm_config is None:
+        llm_config = LLM_CONFIG
+    
     SYS_CONFIG.mock_profiling = mock
     SYS_CONFIG.max_optimization_rounds = max_rounds
 
@@ -59,7 +69,7 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5) -> Optimizati
     print("  Phase 1/3 : Analyzing Kernel")
     print(separator)
 
-    analyzer = AnalyzerAgent(llm_config=LLM_CONFIG)
+    analyzer = AnalyzerAgent(llm_config=llm_config)
     analysis = analyzer.execute(kernel_code)
 
     print(f"  Bottlenecks found    : {len(analysis.bottlenecks)}")
@@ -74,7 +84,7 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5) -> Optimizati
     print("  Phase 2/3 : Profiling Baseline")
     print(separator)
 
-    profiler = ProfilerAgent(llm_config=LLM_CONFIG, mock_mode=mock)
+    profiler = ProfilerAgent(llm_config=llm_config, mock_mode=mock)
     profile = profiler.execute(kernel_code)
 
     print(f"  Baseline time        : {profile.baseline_time_ms:.2f} ms")
@@ -86,7 +96,7 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5) -> Optimizati
     print(separator)
 
     strategies = analysis.strategies[:max_rounds]
-    optimizer = OptimizerAgent(llm_config=LLM_CONFIG, mock_mode=mock)
+    optimizer = OptimizerAgent(llm_config=llm_config, mock_mode=mock)
     optimization = optimizer.execute(
         kernel_code=kernel_code,
         strategies=strategies,
@@ -170,6 +180,12 @@ def parse_args():
         help="Max optimization rounds (default: 5)",
     )
     parser.add_argument(
+        "--provider",
+        default="openai",
+        choices=["openai", "github_copilot", "qwen"],
+        help="LLM provider (default: openai)",
+    )
+    parser.add_argument(
         "--model",
         default=None,
         help="LLM model name (default: from config)",
@@ -198,12 +214,14 @@ def main():
         print("Error: Input file is empty.", file=sys.stderr)
         sys.exit(1)
 
-    # 可选：覆盖模型
-    if args.model:
-        LLM_CONFIG.model = args.model
+    # 根据 provider 和 model 创建新的 LLM 配置
+    llm_config = LLMConfig(
+        provider=args.provider,
+        model=args.model or LLM_CONFIG.model,  # 用参数或默认值
+    )
 
     # 检查 API key
-    if not LLM_CONFIG.api_key:
+    if not llm_config.api_key:
         print(
             "Error: No API key found.\n"
             "  OpenAI:         export OPENAI_API_KEY=sk-xxx\n"
@@ -213,17 +231,19 @@ def main():
         )
         sys.exit(1)
 
-    print(f"\nInput  : {args.input}")
-    print(f"Output : {args.output}")
-    print(f"Model  : {LLM_CONFIG.model}")
-    print(f"Mock   : {args.mock}")
-    print(f"Rounds : {args.rounds}")
+    print(f"\nInput    : {args.input}")
+    print(f"Output   : {args.output}")
+    print(f"Provider : {llm_config.provider}")
+    print(f"Model    : {llm_config.model}")
+    print(f"Mock     : {args.mock}")
+    print(f"Rounds   : {args.rounds}")
 
     # 运行优化
     report = run(
         kernel_code=kernel_code,
         mock=args.mock,
         max_rounds=args.rounds,
+        llm_config=llm_config,
     )
 
     # 保存结果
