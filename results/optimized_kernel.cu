@@ -1,20 +1,20 @@
 /*
  * ================================================================
  *  KernelOptiAgent - Optimization Summary
- *  Generated : 2026-04-17 15:29:02
+ *  Generated : 2026-04-17 17:27:03
  * ================================================================
  *
- *  Baseline time  : 0.444 ms
- *  Optimized time : 0.395 ms
- *  Total speedup  : 10.9%
+ *  Baseline time  : 0.345 ms
+ *  Optimized time : 0.345 ms
+ *  Total speedup  : 0.0%
  *
  *  Bottlenecks identified:
- *    - Memory bandwidth saturation due to low arithmetic intensity
- *    - Suboptimal memory transaction granularity using scalar loads/stores
+ *    - memory_bound (score=1.00, evidence: arithmetic_intensity=low, loads_per_flop=2.0)
+ *    - memory_latency_bound (score=0.90, evidence: independent_loads=True)
+ *    - compute_underutilized (score=0.67, evidence: flops_per_element=1.0)
  *
  *  Changes applied:
- *    [1] Use vectorized memory access (float4) to reduce instruction overhead and improve bandwidth utilization
- *    [2] Apply read-only cache hints (__ldg) for input arrays to utilize read-only data cache
+ *    [1] Use float4 vectorized loads and __ldg() to increase memory throughput
  *
  * ================================================================
  */
@@ -35,18 +35,10 @@
 #define N (1 << 20)  // 1M elements
 
 // 简单的向量加法 kernel（未优化）
-__global__ void vector_add(
-    const float *__restrict__ a,
-    const float *__restrict__ b,
-    float *__restrict__ c,
-    int n) 
-{
+__global__ void vector_add(float *a, float *b, float *c, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
-        // 应用只读缓存提示 __ldg
-        float val_a = __ldg(&a[idx]);
-        float val_b = __ldg(&b[idx]);
-        c[idx] = val_a + val_b;
+        c[idx] = a[idx] + b[idx];
     }
 }
 

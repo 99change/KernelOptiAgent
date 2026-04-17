@@ -6,6 +6,10 @@
  * 1. float4 没有重载的 + 运算符，必须对 .x .y .z .w 分量分别操作
  * 2. N 必须是 4 的倍数，或者尾部单独处理
  * 3. 指针需要转型为 float4*
+ * 4. __ldg() 接受指针（const T*），不接受值（T）！必须传 &ptr[idx] 或 ptr+idx
+ *    错误: __ldg(reinterpret_cast<float4*>(a)[idx])   // 传了 float4 值，编译报错
+ *    正确: __ldg(&reinterpret_cast<const float4*>(a)[idx])  // 传指针，OK
+ *    正确: __ldg(reinterpret_cast<const float4*>(a) + idx)  // 传指针，OK
  */
 
 #include <cuda_runtime.h>
@@ -14,7 +18,7 @@
 
 #define N (1 << 20)
 
-// 正确的 float4 向量加法 kernel
+// 正确的 float4 向量加法 kernel（无 __ldg）
 __global__ void vector_add_float4(float *a, float *b, float *c, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int n4 = n / 4;
@@ -41,6 +45,33 @@ __global__ void vector_add_float4(float *a, float *b, float *c, int n) {
         for (int i = tail_start; i < n; i++) {
             c[i] = a[i] + b[i];
         }
+    }
+}
+
+// float4 + __ldg() 正确用法示例
+// __ldg() 必须接受指针 (const T*)，不接受值 (T)！
+// 错误（编译报错）:  __ldg(reinterpret_cast<float4*>(b)[idx])
+// 正确:             __ldg(&reinterpret_cast<const float4*>(b)[idx])
+// 正确(等价写法):    __ldg(reinterpret_cast<const float4*>(b) + idx)
+__global__ void vector_add_float4_ldg(const float * __restrict__ a,
+                                       const float * __restrict__ b,
+                                       float *c, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n4 = n / 4;
+
+    if (idx < n4) {
+        // 正确：传指针给 __ldg，返回 float4 值
+        float4 va = __ldg(&reinterpret_cast<const float4*>(a)[idx]);
+        float4 vb = __ldg(&reinterpret_cast<const float4*>(b)[idx]);
+        float4 vc;
+
+        // float4 必须逐分量操作
+        vc.x = va.x + vb.x;
+        vc.y = va.y + vb.y;
+        vc.z = va.z + vb.z;
+        vc.w = va.w + vb.w;
+
+        reinterpret_cast<float4*>(c)[idx] = vc;
     }
 }
 

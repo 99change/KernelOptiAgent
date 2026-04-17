@@ -21,6 +21,7 @@ _KEYWORD_MAP: dict[str, list[str]] = {
     "float4_vectorized.cu": [
         "float4", "vectorized", "vector load", "vectorize",
         "128-bit", "16-byte", "memory throughput", "wide load",
+        "__ldg", "ldg", "read-only cache", "texture cache",
     ],
     "restrict_qualifiers.cu": [
         "__restrict__", "restrict", "alias", "pointer alias",

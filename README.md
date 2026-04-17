@@ -1,11 +1,6 @@
-# GPU Kernel 优化 Agent - 已上线架构
+# KernelOptiAgent
 
-## 核心理念
-
-- **3 个 Agent**：分工简单，职责清晰
-- **工具即函数**：不要过度抽象
-- **流程驱动**：main.py 中清晰可见
-- **增量扩展**：先能跑，再优化
+自动优化 CUDA kernel 的 3-Agent 系统。输入 naive kernel，输出带注释的优化版本。
 
 ---
 
@@ -13,221 +8,115 @@
 
 ```
 KernelOptiAgent/
-│
 ├── agents/
-│   ├── __init__.py
-│   ├── base.py                  # [1] Agent 基类（~50 行）
-│   ├── analyzer.py              # [2] 代码分析 Agent
-│   ├── profiler.py              # [3] 性能测评 Agent  
-│   └── optimizer.py             # [4] 优化执行 Agent
-│
+│   ├── base.py              # Agent 基类
+│   ├── analyzer.py          # 瓶颈分析 Agent
+│   ├── profiler.py          # 基准测评 Agent
+│   └── optimizer.py         # 优化执行 Agent
 ├── tools/
-│   ├── __init__.py
-│   └── kernel_tools.py          # [5] 所有工具函数集合
-│
+│   ├── kernel_tools.py      # nvcc 编译 + GPU 测评
+│   └── knowledge_retrieval.py  # strategy → 示例代码检索
+├── knowledge/               # CUDA 优化模式示例库
+│   ├── float4_vectorized.cu
+│   ├── shared_memory_tiling.cu
+│   ├── loop_unrolling.cu
+│   ├── occupancy_tuning.cu
+│   └── restrict_qualifiers.cu
 ├── core/
-│   ├── __init__.py
-│   ├── models.py                # [6] 数据模型定义
-│   ├── memory.py                # [7] 简单记忆系统
-│   └── config.py                # [8] 配置管理
-│
-├── utils/
-│   ├── __init__.py
-│   ├── logger.py                # 日志
-│   └── errors.py                # 错误处理
-│
-├── main.py                      # [9] 主程序入口
-├── SIMPLE_DESIGN.md             # 本文件
-└── requirements.txt
+│   ├── models.py            # 数据模型（含 BottleneckIR）
+│   ├── config.py            # LLM 配置（Qwen / Dashscope）
+│   └── memory.py
+├── main.py                  # 主入口
+└── results/                 # 输出目录
 ```
 
-## 数据流（简化版）
+---
+
+## 数据流
 
 ```
 Input Kernel Code
         ↓
   [AnalyzerAgent]
-  - 代码解析
-  - 识别优化机会
-  → AnalysisResult {strategies, bottlenecks}
+  - LLM 以"填表"方式输出 BottleneckIR（固定 schema，跑 3 次取均值）
+  → BottleneckIR { non_coalesced_memory: {score, evidence}, ... }
+  → strategies（按 score 排序）
         ↓
   [ProfilerAgent]
-  - 基准测评
-  - 性能数据采集
-  → ProfileResult {baseline_time, metrics}
+  - 编译 + GPU 实测
+  → baseline_time_ms
         ↓
   [OptimizerAgent]
-  ├─ For each strategy:
-  │  ├─ 生成优化代码
-  │  ├─ 编译 + 验证
-  │  ├─ 测评性能
-  │  └─ 决策保留/丢弃
-  → OptimizationResult {optimized_code, speedup}
+  ├─ For each strategy (按 score 排序):
+  │  ├─ knowledge_retrieval(strategy) → 注入示例代码
+  │  ├─ 构建 hardware-aware prompt（IR score + constraints + 示例）
+  │  ├─ LLM 改写代码
+  │  ├─ 编译 + 实测
+  │  ├─ 异常检测（>10x 慢则丢弃）
+  │  └─ 超过阈值才保留
+  → best optimized_code + speedup
         ↓
-Output Optimized Kernel + Report
+Output: results/optimized_kernel.cu（含修改说明注释）+ report
 ```
 
 ---
 
-## 关键特点
+## Structured Bottleneck IR
 
-| 特性 | 实现方式 |
-|------|--------|
-| **模块化** | 3 个 Agent + 工具库，职责清晰 |
-| **可实现** | 每个文件 < 200 行代码 |
-| **可扩展** | 新增 Agent 只需继承 BaseAgent |
-| **可测试** | 每个 Agent 独立，容易单测 |
-| **可观测** | main.py 中清晰看到全流程 |
-| **核心完整** | 有分析、测评、优化三个阶段 |
+LLM 不写自由文本描述瓶颈，而是填写固定 schema 的 JSON，每个字段输出 `score`（0~1）和 `evidence`：
+
+| 字段 | 含义 |
+|------|------|
+| `non_coalesced_memory` | 非合并访存 |
+| `memory_bound` | 内存带宽瓶颈 |
+| `low_occupancy` | GPU 占用率低 |
+| `high_register_pressure` | 寄存器压力大 |
+| `warp_divergence` | Warp 分支分歧 |
+| `compute_underutilized` | 计算资源未充分利用 |
+| `shared_memory_underused` | Shared memory 未利用 |
+| `memory_latency_bound` | 内存延迟瓶颈 |
+
+- **3 次聚合**：同一 kernel 跑 LLM 3 次，score 取均值，防止单次不稳定
+- **阈值激活**：`score >= 0.4` 才触发对应优化策略
+- **约束推导**：高 score 的瓶颈影响 prompt 约束（如 `high_register_pressure` 高 → 提示 LLM 避免新增变量）
 
 ---
 
-## 知识补偿方案（解决 LLM CUDA 能力不足问题）
+## 知识库注入
 
-> 背景：通用 LLM 没有深度 CUDA 优化知识，直接让它"生成优化代码"效果差。
-> 解法：在推理时把专业知识外挂进去，让 LLM 做"代码改写"而非"知识发明"。
+`OptimizerAgent` 构建 prompt 时，按策略关键词检索 `knowledge/` 目录中的示例代码并注入，让 LLM 做"代码改写"而非"知识发明"。每个示例文件带详细注释，包含常见错误用法说明（如 `__ldg` 必须传指针而非值）。
 
-### 三层补偿策略
-
-**1. 知识库 + Few-shot 注入（主要手段）**
-
-新增 `knowledge/` 目录，存放带完整注释的 CUDA 优化模式示例代码。
-`AnalyzerAgent` 识别出策略后，`OptimizerAgent` 在构建 prompt 时自动检索并注入：
-
-```
-prompt = """
-这是 shared memory tiling 的标准实现模式：
---- 示例开始 ---
-[knowledge/shared_memory_tiling.cu 的内容]
---- 示例结束 ---
-
-现在，按照上面的模式，将以下 naive kernel 改写：
-[目标 kernel 代码]
-"""
-```
-
-新增文件：
-```
-knowledge/
-├── shared_memory_tiling.cu      # Tiled matmul 示例 + 注释
-├── memory_coalescing.cu         # Coalesced access 示例
-├── loop_unrolling.cu            # #pragma unroll 示例
-├── warp_primitives.cu           # __shfl_down_sync 等示例
-└── occupancy_tuning.cu          # block size / register 调优示例
-
-tools/
-└── knowledge_retrieval.py       # strategy → 相关示例代码检索
-```
-
-**2. Profile 数据反馈驱动（迭代提升手段）**
-
-将 `ProfilerAgent` 的真实 ncu/nvprof 数据反馈给 `OptimizerAgent`，
-每轮优化不再盲猜，而是基于具体数字做决策：
-
-```
-数据流变化：
-  ProfileResult { exec_time_ms, bandwidth_util, occupancy, ... }
-        ↓ (作为 context 传入)
-  OptimizerAgent 的下一轮 prompt：
-  "当前 bandwidth 利用率 40%，occupancy 62%，
-   请针对 bandwidth 瓶颈选择下一步优化策略"
-```
-
-**3. 模板填充模式（最稳健的 fallback）**
-
-对高频优化场景（如 matmul tiling），提供预写好的代码模板，
-让 LLM 只负责填入参数（tile size、block dim 等），不负责生成结构：
-
-```python
-# tools/kernel_tools.py 中新增
-def apply_tiling_template(kernel_code: str, tile_size: int) -> str:
-    """用 LLM 抽取参数 + 填入标准 tiling 模板"""
-    ...
-```
-
-### 更新后的数据流
-
-```
-Input Kernel Code
-        ↓
-  [AnalyzerAgent]
-  - 静态分析
-  - 识别策略列表
-  → AnalysisResult {strategies, bottlenecks}
-        ↓
-  [ProfilerAgent]
-  - 基准测评
-  → ProfileResult {baseline_time, bandwidth_util, occupancy}
-        ↓
-  [OptimizerAgent]
-  ├─ For each strategy:
-  │  ├─ knowledge_retrieval(strategy) → 示例代码          ← 新增
-  │  ├─ 构建 prompt（含示例 + profile 数据）               ← 新增
-  │  ├─ LLM 改写代码（基于示例，非凭空发明）
-  │  ├─ 编译 + 验证
-  │  ├─ 测评性能
-  │  └─ 将结果写回 profile context，驱动下一轮             ← 新增
-  → OptimizationResult {optimized_code, speedup}
-        ↓
-Output Optimized Kernel + Report
-```
 ---
 
-## Test-Time Scaling（TTS）方向
+## 快速上手
 
-> 核心洞察：训练时模型固定了，但推理时投入更多计算量可以持续提升效果。
-> 在有明确验证标准的任务（数学、代码）上，性能 ∝ log(推理计算量)。
+```bash
+# 需要环境变量
+export DASHSCOPE_API_KEY=your_key
 
-### 本项目天然适合 TTS 的原因
+python main.py --input examples/vector_add.cu
+python main.py --input examples/matmul_naive.cu --rounds 3
+python main.py --input your_kernel.cu --model qwen-max --rounds 5
+```
 
-NLP 任务做 TTS 的最大障碍是需要训练 Reward Model 来评估输出质量。
-**本项目不需要**——`nvcc` 编译器 + GPU 实测 speedup 本身就是完美的硬指标 Verifier。
+---
+
+# 待完成
+
+## Test-Time Scaling（TTS）
+
+> 核心洞察：训练时模型固定，但推理时投入更多计算量可持续提升效果。
+> 本项目天然适合 TTS——`nvcc` 编译 + GPU 实测 speedup 本身就是完美的 Verifier，无需训练 Reward Model。
 
 | TTS 要素 | 本项目中的对应物 |
 |----------|----------------|
-| 候选生成（Best-of-N） | 同一策略让 LLM 生成 N 种优化代码变体 |
-| **Verifier** | `nvcc` 编译通过 + 实测 speedup 数值（无需训练） |
-| 搜索策略 | 当前是贪心串行；可升级为 MCTS / Beam Search |
-| 计算预算控制 | 设定最多尝试 K 次，或总时间上限 T 秒 |
+| 候选生成（Best-of-N） | 同一策略让 LLM 生成 N 种变体 |
+| Verifier | `nvcc` 编译通过 + 实测 speedup（无需训练） |
+| 搜索策略 | 当前贪心串行；可升级为 MCTS / Beam Search |
+| 计算预算控制 | 最多尝试 K 次，或总时间上限 T 秒 |
 
-### 三种 TTS 实现路径
+**Best-of-N（最易落地）**：同一策略生成 N 个变体，全部编译测评，取最优保留。计算量增加 N 倍，优化质量可观提升，不需要改模型。
 
-**Best-of-N（最易落地）**
-```
-同一策略 → LLM 生成 N 个变体（temperature > 0）
-         → 全部编译 + 测评
-         → 取 speedup 最高的保留
-```
-
-**Beam Search**
-```
-维护 top-K 个当前最优代码版本
-每轮对每个版本继续生成下一步优化
-剪枝 speedup 低于阈值的分支
-```
-
-**MCTS（计算预算充足时）**
-```
-节点 = 某个优化状态的代码
-展开 = LLM 生成子优化
-评分 = 实测 speedup（UCB 公式平衡探索/利用）
-适合参数搜索空间大的场景（tile_size × block_dim × unroll_factor）
-```
-
-### 对 OptimizerAgent 的影响
-
-当前实现是每个策略只生成一次代码（greedy）：
-```python
-optimized_code = self._generate_optimized_code(best_code, strategy)  # 只调用一次
-```
-
-引入 TTS 后改为 Best-of-N：
-```python
-candidates = [self._generate_optimized_code(best_code, strategy) for _ in range(N)]
-# 全部编译测评，取最优
-best_candidate = max(candidates, key=lambda c: compile_and_test(c).speedup)
-```
-
-计算量增加 N 倍，但优化质量可观地提升，且完全不需要改模型。
+**Profile 数据反馈**：将 ProfilerAgent 的 bandwidth/occupancy 等指标传入 OptimizerAgent prompt，基于具体数字选策略而非静态分析。
 
 

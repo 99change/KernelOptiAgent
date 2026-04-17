@@ -70,9 +70,13 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: L
     analyzer = AnalyzerAgent(llm_config=llm_config)
     analysis = analyzer.execute(kernel_code)
 
-    print(f"  Bottlenecks found    : {len(analysis.bottlenecks)}")
-    for b in analysis.bottlenecks:
-        print(f"    - {b}")
+    # 打印结构化 IR（按 score 降序）
+    print(f"  Bottleneck IR ({len(analysis.bottleneck_ir)} types assessed):")
+    sorted_ir = sorted(analysis.bottleneck_ir.items(), key=lambda x: x[1].score, reverse=True)
+    for key, item in sorted_ir:
+        bar = "█" * int(item.score * 10) + "░" * (10 - int(item.score * 10))
+        active = " ◀ active" if item.score >= 0.4 else ""
+        print(f"    {key:<28} [{bar}] {item.score:.2f}{active}")
     print(f"  Strategies proposed  : {len(analysis.strategies)}")
     for s in analysis.strategies:
         print(f"    - {s}")
@@ -99,6 +103,7 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: L
         kernel_code=kernel_code,
         strategies=strategies,
         baseline_time_ms=profile.baseline_time_ms,
+        bottleneck_ir=analysis.bottleneck_ir,
     )
 
     successful = [h for h in optimization.history if h.success]
