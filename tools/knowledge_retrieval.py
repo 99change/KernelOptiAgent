@@ -40,6 +40,12 @@ _KEYWORD_MAP: dict[str, list[str]] = {
         "__launch_bounds__", "register pressure", "sm utilization",
         "active warps", "increase occupancy",
     ],
+    "latency_hiding.cu": [
+        "prefetch", "latency", "pipeline", "pipelining", "double buffer",
+        "memory latency", "hide latency", "overlap", "ilp", "mlp",
+        "memory-level parallelism", "instruction-level parallelism",
+        "software pipeline", "async", "memcpy_async",
+    ],
 }
 
 

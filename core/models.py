@@ -22,7 +22,7 @@ BOTTLENECK_STRATEGIES = {
     "warp_divergence":         "Eliminate branch divergence within warps by restructuring conditionals",
     "compute_underutilized":   "Increase arithmetic intensity by fusing operations or using tensor cores",
     "shared_memory_underused": "Tile global memory accesses through shared memory to exploit data reuse",
-    "memory_latency_bound":    "Prefetch data and overlap memory transfers with computation",
+    "memory_latency_bound":    "Hide memory latency using __ldg() read-only cache, software pipelining with register double-buffering, or cuda::memcpy_async. Never use __builtin_prefetch (host-only). Increase ILP so warps can hide latency.",
 }
 
 
