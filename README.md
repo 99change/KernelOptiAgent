@@ -1,4 +1,4 @@
-# KernelOptiAgent（已完成）
+# KernelOptiAgent（已上线部分）
 
 自动优化 CUDA kernel 的 3-Agent 系统。输入 naive kernel，输出带注释的优化版本。
 
@@ -97,7 +97,6 @@ LLM 不写自由文本描述瓶颈，而是填写固定 schema 的 JSON，每个
 export DASHSCOPE_API_KEY=your_key
 
 python main.py --input examples/vector_add.cu
-python main.py --input examples/matmul_naive.cu --rounds 3
 python main.py --input your_kernel.cu --model qwen-max --rounds 5
 ```
 
@@ -128,8 +127,6 @@ python main.py --input your_kernel.cu --model qwen-max --rounds 5
   * (Nsight → bottleneck)
 * 训练 classifier（替代 LLM）
 
-👉 到这里你就已经超过大多数工作了
-
 ---
 
 ## Phase 3（真正研究点）
@@ -137,10 +134,3 @@ python main.py --input your_kernel.cu --model qwen-max --rounds 5
 * bottleneck → optimization policy
 * 或：
 * bottleneck → search space reduction
-
----
-
-# 六、你这个方案的本质创新点（如果你做出来）
-
-> **“构建了 hardware-aware structured feedback representation”**
-
