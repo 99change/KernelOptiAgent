@@ -45,25 +45,39 @@ class OptimizerAgent(BaseAgent):
                 self.logger.warning(f"    LLM returned empty code for strategy: {strategy}")
                 continue
 
-            # 2. 编译 + 测评（或 mock）
-            try:
-                if self.mock_mode:
-                    test_result = mock_profile(optimized_code)
-                else:
-                    test_result = compile_and_test(optimized_code)
-            except Exception as e:
-                self.logger.warning(f"    Test failed: {e}")
-                history.append(OptimizationHistory(
-                    strategy=strategy,
-                    speedup=0.0,
-                    exec_time_ms=0.0,
-                    code=optimized_code,
-                    success=False,
-                ))
-                continue
+            # 2. 编译 + 测评（支持 self-repair 最多 2 次）
+            MAX_REPAIR = 2
+            test_result = None
+            for repair_attempt in range(MAX_REPAIR + 1):
+                try:
+                    if self.mock_mode:
+                        test_result = mock_profile(optimized_code)
+                    else:
+                        test_result = compile_and_test(optimized_code)
+                except Exception as e:
+                    self.logger.warning(f"    Test failed: {e}")
+                    break
 
-            if not test_result.success:
-                self.logger.warning(f"    Compile/run failed: {test_result.error}")
+                if test_result.success:
+                    break
+
+                # 编译失败 → self-repair
+                if repair_attempt < MAX_REPAIR:
+                    self.logger.info(
+                        f"    Compile error (attempt {repair_attempt+1}/{MAX_REPAIR}), trying self-repair..."
+                    )
+                    repaired = self._repair_code(optimized_code, test_result.error)
+                    if repaired:
+                        optimized_code = repaired
+                    else:
+                        self.logger.warning("    Self-repair returned empty code, giving up")
+                        break
+                else:
+                    self.logger.warning(
+                        f"    Compile/run failed after {MAX_REPAIR} repair attempts: {test_result.error[:120]}"
+                    )
+
+            if test_result is None or not test_result.success:
                 history.append(OptimizationHistory(
                     strategy=strategy,
                     speedup=0.0,
@@ -252,6 +266,36 @@ Return just the raw code, no markdown fences.
                 inner = inner[:-1]
             result = "\n".join(inner)
 
+        return result.strip()
+
+    def _repair_code(self, broken_code: str, error_msg: str) -> str:
+        """Self-repair: feed nvcc error back to LLM and ask it to fix the code."""
+        prompt = f"""You are a CUDA expert. The following CUDA code failed to compile with nvcc.
+Fix ONLY the compilation errors. Do not change the optimization logic or algorithm.
+
+## Compiler Error:
+```
+{error_msg[:1500]}
+```
+
+## Broken Code:
+```cuda
+{broken_code}
+```
+
+## Requirements:
+- Fix all compilation errors shown above
+- Preserve all existing optimizations (shared memory tiling, loop unrolling, etc.)
+- Keep the kernel semantically correct (same output for same input)
+- Return ONLY the complete fixed .cu source code, no explanation, no markdown fences
+"""
+        result = self._think(prompt, expect_json=False)
+        if result.startswith("```"):
+            lines = result.splitlines()
+            inner = lines[1:]
+            if inner and inner[-1].strip() == "```":
+                inner = inner[:-1]
+            result = "\n".join(inner)
         return result.strip()
 
     def _generate_e2e_code(self, kernel_code: str) -> str:
