@@ -105,6 +105,34 @@ python main.py --input your_kernel.cu --model qwen-max --rounds 5
 
 # 待完成
 
+## 优先级 P0（当前代码已知缺陷，需先修复）
+
+### 1. Analyzer：替换假静态分析工具
+当前 `analyze_syntax` / `detect_memory_pattern` / `estimate_parallelism` 均为正则手写，信息量极低（大量结果为 `unknown` / `N/A`），不如不传。
+
+**替换目标：**
+- 用 `nvcc --ptxas-options=-v` 编译输出提取**寄存器数量、shared memory 用量、spill 情况**
+- 集成 `ncu`（Nsight Compute CLI）获取**memory throughput、occupancy、warp efficiency、arithmetic intensity**
+- 这些数值是 LLM 读代码无法推断的，才是静态工具对 BottleneckIR 的真实贡献
+
+### 2. Profiler：去除 LLM 调用，改为纯工具流
+当前 `ProfilerAgent` 在 `execute()` 末尾调用一次 LLM，仅凭执行时间数字生成一句瓶颈描述。这段描述信息量极低且与 Analyzer 的 BottleneckIR 重复，属于无效 token 消耗。
+
+**改造目标：**
+- `ProfilerAgent` 降级为纯函数（或保留 Agent 壳但不调用 `_think`）
+- `execute()` 直接返回 `ProfileResult`（含 `baseline_time_ms` + `metrics`），不生成 `bottleneck_description`
+- 瓶颈描述统一由 Analyzer 负责，职责边界清晰
+
+### 3. Optimizer：添加 Chain-of-Thought 规划步骤
+当前 `_generate_optimized_code` 让 LLM 一步直接输出代码，策略意图和代码实现混在一个 prompt 里，容易导致幻觉或策略未实际落地。
+
+**改造目标：**
+- 在代码生成前增加一步"规划 prompt"：让 LLM 先输出结构化修改方案（改哪个变量、tile size 取多少、unroll factor 是多少等），作为中间推理步骤
+- 再用规划方案 + 原始代码构建"编码 prompt"，LLM 只负责按方案机械改写
+- 规划输出可记录到 `OptimizationHistory`，便于 debug 策略是否真正被执行
+
+---
+
 ## Test-Time Scaling
 
 > 核心洞察：训练时模型固定，但推理时投入更多计算量可持续提升效果。
