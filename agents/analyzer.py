@@ -2,14 +2,17 @@
 analyzer.py
 分析 CUDA kernel，输出结构化 bottleneck IR（固定 schema + score + evidence）。
 LLM 只负责"填表"，不做自由文本分析。多次运行后对 score 取平均（aggregation）。
+硬件数字（ptxas + ncu）由 ProfilerAgent 采集，是 LLM 打分的唯一依据。
 """
 
 from typing import Dict, List, Any
 
-from core.models import AnalysisResult, BottleneckItem, BOTTLENECK_SCHEMA, BOTTLENECK_STRATEGIES
+from core.models import (
+    AnalysisResult, BottleneckItem, BOTTLENECK_SCHEMA, BOTTLENECK_STRATEGIES,
+    HardwareProfile,
+)
 from core.config import LLM_CONFIG
 from agents.base import BaseAgent
-from tools.kernel_tools import analyze_syntax, detect_memory_pattern, estimate_parallelism
 
 # 同一输入运行 LLM 的次数，取 score 均值以提升稳定性
 _N_AGGREGATIONS = 3
@@ -22,59 +25,60 @@ class AnalyzerAgent(BaseAgent):
     def __init__(self, llm_config=LLM_CONFIG):
         super().__init__("AnalyzerAgent", llm_config)
 
-    def execute(self, kernel_code: str) -> AnalysisResult:
-        self.logger.info("Starting kernel analysis (structured IR mode)...")
+    def execute(self, kernel_code: str, hardware_profile: HardwareProfile) -> AnalysisResult:
+        self.logger.info("Starting kernel analysis (hardware-grounded IR mode)...")
 
-        # 1. 静态分析工具（不需要 LLM）
-        syntax_info    = analyze_syntax(kernel_code)
-        memory_pattern = detect_memory_pattern(kernel_code)
-        parallelism    = estimate_parallelism(kernel_code)
+        # 硬件 profiling 摘要
+        hw_ctx = hardware_profile.summary()
 
-        static_ctx = (
-            f"- Kernel count: {syntax_info['kernel_count']}\n"
-            f"- Uses shared memory: {syntax_info['has_shared_memory']}\n"
-            f"- Uses atomics: {syntax_info['has_atomics']}\n"
-            f"- Loop depth: {syntax_info['loop_depth']}\n"
-            f"- Memory access pattern: {memory_pattern}\n"
-            f"- Parallelism config: {parallelism}"
-        )
+        # 自动注释：bound 类型 + occupancy 警告
+        mem = hardware_profile.ncu.memory_throughput_pct
+        cmp = hardware_profile.ncu.compute_throughput_pct
+        occ = hardware_profile.ncu.achieved_occupancy_pct
+        regs = hardware_profile.ptxas.registers
+        hw_notes = f"  bound_type: {'memory-bound' if mem > cmp else 'compute-bound'}\n"
+        hw_notes += f"  registers/thread: {regs} {'(HIGH, likely limits occupancy)' if regs > 64 else '(normal)'}\n"
+        if occ < 25:
+            hw_notes += f"  occupancy: {occ:.1f}% — CRITICALLY LOW\n"
+        elif occ < 50:
+            hw_notes += f"  occupancy: {occ:.1f}% — LOW\n"
 
-        # 2. 构建"填表"prompt
+        # 构建"填表"prompt
         schema_example = "\n".join(
             f'  "{k}": {{"score": <0.0-1.0>, "evidence": {{...}}}},'
             for k in BOTTLENECK_SCHEMA
         )
+
         prompt = f"""You are a CUDA performance expert acting as a structured form filler.
 
-## Static Analysis:
-{static_ctx}
-
+## Measured Hardware Profile (ground truth — trust these numbers, not code guesses):
+{hw_ctx}
+{hw_notes}
 ## Kernel Code:
 ```cuda
 {kernel_code}
 ```
 
-Fill in the bottleneck assessment form below.
-For each entry assign a score (0.0 = not present, 1.0 = severe) and provide concise evidence
-derived only from the code and static analysis above.
+Fill in the bottleneck assessment form. Assign score (0.0 = not present, 1.0 = severe).
+Base scores on the measured hardware data above. Put actual measured numbers in evidence fields.
 
 Return ONLY a valid JSON object with EXACTLY these keys (no extra keys, no explanation text):
 {{
 {schema_example}
 }}
 
-Evidence field examples:
-- non_coalesced_memory: {{"stride": <int>, "access_pattern": "strided/random"}}
-- memory_bound: {{"arithmetic_intensity": "low/medium/high", "loads_per_flop": <float>}}
-- low_occupancy: {{"block_size": <int>, "registers_estimated": "high/low"}}
-- high_register_pressure: {{"loop_depth": <int>, "temp_vars": "many/few"}}
-- warp_divergence: {{"branches_in_kernel": true/false, "condition_type": "..."}}
-- compute_underutilized: {{"flops_per_element": <float>}}
-- shared_memory_underused: {{"data_reuse_possible": true/false}}
-- memory_latency_bound: {{"independent_loads": true/false}}
+Evidence field format (use measured values):
+- non_coalesced_memory: {{"access_pattern": "coalesced/strided/random"}}
+- memory_bound: {{"memory_throughput_pct": {mem:.1f}, "dram_throughput_pct": {hardware_profile.ncu.dram_throughput_pct:.1f}}}
+- low_occupancy: {{"achieved_occupancy_pct": {occ:.1f}, "registers": {regs}}}
+- high_register_pressure: {{"registers": {regs}, "spill_stores": {hardware_profile.ptxas.spill_stores}}}
+- warp_divergence: {{"branches_in_kernel": true/false}}
+- compute_underutilized: {{"compute_throughput_pct": {cmp:.1f}}}
+- shared_memory_underused: {{"smem_bytes": {hardware_profile.ptxas.smem_bytes}, "data_reuse_possible": true/false}}
+- memory_latency_bound: {{"memory_throughput_pct": {mem:.1f}, "compute_throughput_pct": {cmp:.1f}}}
 """
 
-        # 3. 聚合：跑 N 次，对每个 bottleneck 的 score 取均值
+        # 聚合：跑 N 次，对每个 bottleneck 的 score 取均值
         raw_scores: Dict[str, List[float]] = {k: [] for k in BOTTLENECK_SCHEMA}
         last_evidence: Dict[str, Any] = {k: {} for k in BOTTLENECK_SCHEMA}
 
@@ -92,7 +96,7 @@ Evidence field examples:
             except Exception as e:
                 self.logger.warning(f"Aggregation run {i+1} failed: {e}")
 
-        # 4. 构建 BottleneckIR（平均 score）
+        # 构建 BottleneckIR（平均 score）
         bottleneck_ir: Dict[str, BottleneckItem] = {}
         for key in BOTTLENECK_SCHEMA:
             scores = raw_scores[key]
@@ -102,7 +106,7 @@ Evidence field examples:
                 evidence=last_evidence[key],
             )
 
-        # 5. 从 IR 推导人类可读描述和优化策略（按 score 排序）
+        # 从 IR 推导人类可读描述和优化策略（按 score 排序）
         sorted_items = sorted(
             bottleneck_ir.items(), key=lambda x: x[1].score, reverse=True
         )
@@ -112,7 +116,7 @@ Evidence field examples:
         for key, item in sorted_items:
             if item.score >= _SCORE_THRESHOLD:
                 ev = item.evidence
-                ev_str = ", ".join(f"{k}={v}" for k, v in ev.items()) if ev else "code analysis"
+                ev_str = ", ".join(f"{k}={v}" for k, v in ev.items()) if ev else ""
                 bottlenecks.append(f"{key} (score={item.score:.2f}, evidence: {ev_str})")
                 strategies.append(BOTTLENECK_STRATEGIES[key])
 
@@ -127,5 +131,6 @@ Evidence field examples:
             code_snippet=kernel_code,
             raw_analysis=str(bottleneck_ir),
             bottleneck_ir=bottleneck_ir,
+            hardware_profile=hardware_profile,
         )
 

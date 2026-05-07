@@ -1,0 +1,15 @@
+GPU Kernel Optimization Report
+============================================================
+
+Baseline time    : 0.56 ms
+Optimized time   : 0.43 ms
+Speedup          : 23.0%
+
+Bottlenecks identified:
+  - memory_bound (score=1.00, evidence: memory_throughput_pct=70.2, dram_throughput_pct=35.5)
+  - compute_underutilized (score=1.00, evidence: compute_throughput_pct=24.3)
+  - shared_memory_underused (score=1.00, evidence: smem_bytes=0, data_reuse_possible=True)
+
+Strategies applied:
+  - Use float4 vectorized loads and __ldg() to increase memory throughput
+  - Increase arithmetic intensity by loop unrolling (#pragma unroll), ILP (each thread handles multiple elements), or fusing adjacent element-wise operations into one kernel. Do NOT use tensor cores unless the kernel already performs matrix multiply.

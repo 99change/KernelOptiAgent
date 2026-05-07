@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 # 固定 bottleneck 类型 schema（不可随意增删）
 BOTTLENECK_SCHEMA = [
@@ -26,6 +26,62 @@ BOTTLENECK_STRATEGIES = {
 }
 
 
+# ─────────────────────────────────────────────
+# 硬件 Profiling 数据结构
+# ─────────────────────────────────────────────
+
+@dataclass
+class PtxasInfo:
+    """nvcc --ptxas-options=-v 编译期输出，每个 kernel 取最大值"""
+    registers: int = 0          # 每线程寄存器数
+    smem_bytes: int = 0         # 静态 shared memory 字节
+    spill_stores: int = 0       # local memory spill stores（越大越差）
+    spill_loads: int = 0        # local memory spill loads
+    available: bool = False     # 是否成功解析
+
+
+@dataclass
+class NcuMetrics:
+    """ncu 运行时采集的 GPU Speed Of Light 指标"""
+    memory_throughput_pct: float = 0.0    # 整体内存吞吐 % of peak
+    compute_throughput_pct: float = 0.0   # SM 计算吞吐 % of peak
+    dram_throughput_pct: float = 0.0      # DRAM 带宽 % of peak
+    l2_throughput_pct: float = 0.0        # L2 Cache 吞吐 % of peak
+    l1_throughput_pct: float = 0.0        # L1/TEX Cache 吞吐 % of peak
+    achieved_occupancy_pct: float = 0.0   # 实际 warp occupancy %（from Occupancy section）
+    elapsed_cycles: int = 0               # kernel elapsed cycles
+    available: bool = False               # 是否成功采集
+
+
+@dataclass
+class HardwareProfile:
+    """完整的硬件 profiling 数据（编译期 + 运行时）"""
+    exec_time_ms: float = 0.0
+    ptxas: PtxasInfo = field(default_factory=PtxasInfo)
+    ncu: NcuMetrics = field(default_factory=NcuMetrics)
+
+    def summary(self) -> str:
+        """返回供 LLM prompt 使用的简洁文本摘要"""
+        lines = [f"  Execution time: {self.exec_time_ms:.3f} ms"]
+        if self.ptxas.available:
+            lines += [
+                f"  Registers per thread: {self.ptxas.registers}",
+                f"  Static shared memory: {self.ptxas.smem_bytes} bytes",
+                f"  Spill stores: {self.ptxas.spill_stores} bytes",
+                f"  Spill loads:  {self.ptxas.spill_loads} bytes",
+            ]
+        if self.ncu.available:
+            lines += [
+                f"  Memory Throughput:       {self.ncu.memory_throughput_pct:.1f}% of peak",
+                f"  Compute (SM) Throughput: {self.ncu.compute_throughput_pct:.1f}% of peak",
+                f"  DRAM Throughput:         {self.ncu.dram_throughput_pct:.1f}% of peak",
+                f"  L2 Cache Throughput:     {self.ncu.l2_throughput_pct:.1f}% of peak",
+                f"  L1/TEX Throughput:       {self.ncu.l1_throughput_pct:.1f}% of peak",
+                f"  Achieved Occupancy:      {self.ncu.achieved_occupancy_pct:.1f}%",
+            ]
+        return "\n".join(lines)
+
+
 @dataclass
 class BottleneckItem:
     """单个瓶颈的结构化表示"""
@@ -41,6 +97,7 @@ class AnalysisResult:
     code_snippet: str
     raw_analysis: str = ""
     bottleneck_ir: Dict[str, BottleneckItem] = field(default_factory=dict)  # 结构化 IR
+    hardware_profile: "HardwareProfile" = None  # 来自 Profiler 的硬件数据
 
 
 @dataclass
@@ -58,6 +115,7 @@ class ProfileResult:
     metrics: KernelMetrics
     baseline_time_ms: float
     bottleneck_description: str = ""  # 已废弃，保留仅用于兼容；瓶颈分析由 AnalyzerAgent 负责
+    hardware_profile: "HardwareProfile" = None  # 完整硬件数据，传给 AnalyzerAgent
 
 
 @dataclass

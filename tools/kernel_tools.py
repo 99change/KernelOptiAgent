@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass
 from typing import Optional
 
-from core.models import KernelMetrics
+from core.models import KernelMetrics, PtxasInfo, NcuMetrics, HardwareProfile
 
 
 # ─────────────────────────────────────────────
@@ -29,6 +29,11 @@ class CompileResult:
     binary_path: str = ""
     ptx_path: str = ""
     error: str = ""
+    ptxas_info: PtxasInfo = None  # type: ignore
+
+    def __post_init__(self):
+        if self.ptxas_info is None:
+            self.ptxas_info = PtxasInfo()
 
 
 @dataclass
@@ -37,69 +42,6 @@ class TestResult:
     exec_time_ms: float = 0.0
     metrics: Optional[KernelMetrics] = None
     error: str = ""
-
-
-# ─────────────────────────────────────────────
-# 静态分析工具
-# ─────────────────────────────────────────────
-
-def analyze_syntax(code: str) -> dict:
-    """
-    对 CUDA kernel 做轻量级静态分析。
-    返回: {"kernel_count": int, "has_shared_memory": bool,
-           "has_atomics": bool, "loop_depth": int, "line_count": int}
-    """
-    result = {
-        "kernel_count": len(re.findall(r'__global__\s+\w+\s+\w+\s*\(', code)),
-        "has_shared_memory": "__shared__" in code,
-        "has_atomics": bool(re.search(r'atomic\w+', code)),
-        "has_texture": "tex" in code or "texture" in code,
-        "loop_depth": _estimate_loop_depth(code),
-        "line_count": len(code.splitlines()),
-        "thread_idx_usage": "threadIdx" in code,
-        "block_idx_usage": "blockIdx" in code,
-    }
-    return result
-
-
-def detect_memory_pattern(code: str) -> str:
-    """
-    检测内存访问模式，返回描述字符串。
-    简单规则：
-    - 若访问下标是 threadIdx.x，认为 coalesced
-    - 若访问下标含复杂乘法，认为 strided
-    - 其他认为 unknown
-    """
-    # 检测最常见的 coalesced 模式：arr[threadIdx.x] 或 arr[... + threadIdx.x]
-    if re.search(r'\[\s*(?:.*\+\s*)?threadIdx\.x\s*\]', code):
-        return "coalesced"
-    # 检测 strided：arr[threadIdx.x * N]
-    if re.search(r'\[\s*threadIdx\.\w+\s*\*\s*\d+', code):
-        return "strided"
-    # 检测随机访问
-    if re.search(r'\[.*blockIdx.*threadIdx.*\*', code):
-        return "possibly_strided"
-    return "unknown"
-
-
-def estimate_parallelism(code: str) -> dict:
-    """
-    从代码中估计建议的并行度配置。
-    如果代码没有明确指定，返回默认建议。
-    """
-    # 尝试从代码注释或 <<<>>> 中提取
-    launch_match = re.search(r'<<<\s*(\w+)\s*,\s*(\w+)\s*>>>', code)
-    if launch_match:
-        return {
-            "grid_dim": launch_match.group(1),
-            "block_dim": launch_match.group(2),
-            "source": "extracted_from_launch"
-        }
-    return {
-        "grid_dim": "N/A",
-        "block_dim": "N/A",
-        "source": "not_found_in_code"
-    }
 
 
 # ─────────────────────────────────────────────
@@ -142,6 +84,9 @@ def compile_cuda(code: str, gpu_arch: str = "sm_120") -> CompileResult:
         if ret.returncode != 0:
             return CompileResult(success=False, error=ret.stderr)
 
+        # 解析 ptxas 编译统计信息（来自 stderr）
+        ptxas_info = parse_ptxas_info(ret.stderr)
+
         # 同时生成 PTX（用于分析寄存器使用等）
         ptx_cmd = [
             "nvcc", src_path,
@@ -163,7 +108,8 @@ def compile_cuda(code: str, gpu_arch: str = "sm_120") -> CompileResult:
         return CompileResult(
             success=True,
             binary_path=final_bin,
-            ptx_path=final_ptx
+            ptx_path=final_ptx,
+            ptxas_info=ptxas_info,
         )
 
 
@@ -269,3 +215,159 @@ def _parse_time_from_output(output: str) -> Optional[float]:
     if match:
         return float(match.group(1))
     return None
+
+
+# ─────────────────────────────────────────────
+# ptxas 信息解析
+# ─────────────────────────────────────────────
+
+def parse_ptxas_info(stderr: str) -> PtxasInfo:
+    """
+    解析 nvcc --ptxas-options=-v 的 stderr 输出，提取所有 kernel 的最大资源用量。
+
+    典型输出格式：
+      ptxas info    : Used 32 registers, 360 bytes smem, 336 bytes cmem[0]
+      ptxas info    : Function properties for vectorAdd
+                      0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+    """
+    max_regs = 0
+    total_smem = 0
+    total_spill_stores = 0
+    total_spill_loads = 0
+    found = False
+
+    for line in stderr.splitlines():
+        # 解析 "Used N registers, M bytes smem"
+        m = re.search(r'Used\s+(\d+)\s+registers', line)
+        if m:
+            max_regs = max(max_regs, int(m.group(1)))
+            found = True
+
+        m = re.search(r'(\d+)\s+bytes\s+smem', line)
+        if m:
+            total_smem = max(total_smem, int(m.group(1)))
+
+        # 解析 "N bytes stack frame, M bytes spill stores, K bytes spill loads"
+        m = re.search(r'(\d+)\s+bytes\s+spill\s+stores', line)
+        if m:
+            total_spill_stores += int(m.group(1))
+
+        m = re.search(r'(\d+)\s+bytes\s+spill\s+loads', line)
+        if m:
+            total_spill_loads += int(m.group(1))
+
+    return PtxasInfo(
+        registers=max_regs,
+        smem_bytes=total_smem,
+        spill_stores=total_spill_stores,
+        spill_loads=total_spill_loads,
+        available=found,
+    )
+
+
+# ─────────────────────────────────────────────
+# ncu 运行时 profiling
+# ─────────────────────────────────────────────
+
+_NCU_BINARY = "ncu"
+
+# 要采集的 ncu 指标（来自 GPU Speed Of Light Throughput + Occupancy sections）
+_NCU_METRICS = ",".join([
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "lts__throughput.avg.pct_of_peak_sustained_elapsed",
+    "l1tex__throughput.avg.pct_of_peak_sustained_elapsed",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+])
+
+
+def run_ncu_profile(binary_path: str, timeout: int = 120) -> NcuMetrics:
+    """
+    用 ncu 对已编译的 CUDA binary 做一次 profiling，返回关键 GPU 指标。
+    只 profile 第一个 kernel 调用（--kernel-id ::1）以节省时间。
+    失败时返回 available=False 的 NcuMetrics。
+    """
+    if not os.path.exists(binary_path):
+        return NcuMetrics()
+
+    try:
+        cmd = [
+            _NCU_BINARY,
+            "--target-processes", "all",
+            "--metrics", _NCU_METRICS,
+            "--print-summary", "per-kernel",
+            binary_path,
+        ]
+        ret = subprocess.run(
+            cmd,
+            capture_output=True, text=True, timeout=timeout
+        )
+        output = ret.stdout + ret.stderr
+        return _parse_ncu_metrics_output(output)
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return NcuMetrics()
+
+
+def _parse_ncu_metrics_output(text: str) -> NcuMetrics:
+    """
+    解析 ncu --metrics 的文本输出，提取各项百分比指标。
+    ncu 输出格式（每行一个指标）：
+      sm__throughput.avg.pct_of_peak_sustained_elapsed    %    56.81
+    也可能是 summary 格式，需要灵活处理。
+    """
+    values: dict = {}
+
+    # ncu --metrics 输出格式：metric_name  unit  value（以空格对齐）
+    metric_patterns = {
+        "compute": r"sm__throughput\.avg\.pct_of_peak_sustained_elapsed\s+%\s+([\d.]+)",
+        "memory": r"gpu__compute_memory_throughput\.avg\.pct_of_peak_sustained_elapsed\s+%\s+([\d.]+)",
+        "dram": r"dram__throughput\.avg\.pct_of_peak_sustained_elapsed\s+%\s+([\d.]+)",
+        "l2": r"lts__throughput\.avg\.pct_of_peak_sustained_elapsed\s+%\s+([\d.]+)",
+        "l1": r"l1tex__throughput\.avg\.pct_of_peak_sustained_elapsed\s+%\s+([\d.]+)",
+        "occupancy": r"sm__warps_active\.avg\.pct_of_peak_sustained_active\s+%\s+([\d.]+)",
+    }
+
+    for key, pattern in metric_patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            values[key] = float(m.group(1))
+
+    if not values:
+        return NcuMetrics()
+
+    return NcuMetrics(
+        compute_throughput_pct=values.get("compute", 0.0),
+        memory_throughput_pct=values.get("memory", 0.0),
+        dram_throughput_pct=values.get("dram", 0.0),
+        l2_throughput_pct=values.get("l2", 0.0),
+        l1_throughput_pct=values.get("l1", 0.0),
+        achieved_occupancy_pct=values.get("occupancy", 0.0),
+        available=True,
+    )
+
+
+def compile_and_full_profile(code: str, gpu_arch: str = "sm_120") -> HardwareProfile:
+    """
+    完整 profiling pipeline：编译 → 计时 → ncu。
+    返回 HardwareProfile（包含 ptxas 编译期信息 + ncu 运行时信息 + 执行时间）。
+    失败时返回 available=False 的子字段，exec_time_ms=0。
+    """
+    hw = HardwareProfile()
+
+    # 1. 编译（含 ptxas 解析）
+    compile_result = compile_cuda(code, gpu_arch)
+    if not compile_result.success:
+        return hw
+
+    hw.ptxas = compile_result.ptxas_info
+
+    # 2. 计时
+    test_result = run_compiled_kernel(compile_result.binary_path)
+    if test_result.success:
+        hw.exec_time_ms = test_result.exec_time_ms
+
+    # 3. ncu profiling
+    hw.ncu = run_ncu_profile(compile_result.binary_path)
+
+    return hw

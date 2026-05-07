@@ -62,13 +62,39 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: L
 
     separator = "=" * 60
 
-    # ── Phase 1: 分析 ──────────────────────────────────────────
+    # ── Phase 1: 基准测评 + 硬件 Profiling ────────────────────
     print(f"\n{separator}")
-    print("  Phase 1/3 : Analyzing Kernel")
+    print("  Phase 1/3 : Profiling Baseline (ptxas + ncu + timing)")
+    print(separator)
+
+    profiler = ProfilerAgent(mock_mode=mock)
+    profile = profiler.execute(kernel_code)
+
+    print(f"  Baseline time        : {profile.baseline_time_ms:.3f} ms")
+    hw = profile.hardware_profile
+    if hw is not None:
+        if hw.ptxas.available:
+            print(f"  Registers/thread     : {hw.ptxas.registers}")
+            print(f"  Static shared mem    : {hw.ptxas.smem_bytes} bytes")
+            spill = hw.ptxas.spill_stores + hw.ptxas.spill_loads
+            print(f"  Register spill       : {spill} bytes {'⚠' if spill > 0 else '✓'}")
+        if hw.ncu.available:
+            print(f"  Mem Throughput       : {hw.ncu.memory_throughput_pct:.1f}% of peak")
+            print(f"  Compute Throughput   : {hw.ncu.compute_throughput_pct:.1f}% of peak")
+            print(f"  DRAM Throughput      : {hw.ncu.dram_throughput_pct:.1f}% of peak")
+            print(f"  Achieved Occupancy   : {hw.ncu.achieved_occupancy_pct:.1f}%")
+        if not hw.ptxas.available and not hw.ncu.available:
+            print("  [hardware profiling unavailable, using code analysis only]")
+    else:
+        print("  [mock mode: no hardware profiling]")
+
+    # ── Phase 2: 分析 ──────────────────────────────────────────
+    print(f"\n{separator}")
+    print("  Phase 2/3 : Analyzing Kernel (hardware-grounded IR)")
     print(separator)
 
     analyzer = AnalyzerAgent(llm_config=llm_config)
-    analysis = analyzer.execute(kernel_code)
+    analysis = analyzer.execute(kernel_code, hardware_profile=profile.hardware_profile)
 
     # 打印结构化 IR（按 score 降序）
     print(f"  Bottleneck IR ({len(analysis.bottleneck_ir)} types assessed):")
@@ -80,16 +106,6 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: L
     print(f"  Strategies proposed  : {len(analysis.strategies)}")
     for s in analysis.strategies:
         print(f"    - {s}")
-
-    # ── Phase 2: 基准测评 ─────────────────────────────────────
-    print(f"\n{separator}")
-    print("  Phase 2/3 : Profiling Baseline")
-    print(separator)
-
-    profiler = ProfilerAgent(mock_mode=mock)
-    profile = profiler.execute(kernel_code)
-
-    print(f"  Baseline time        : {profile.baseline_time_ms:.2f} ms")
 
     # ── Phase 3: 优化 ─────────────────────────────────────────
     print(f"\n{separator}")
