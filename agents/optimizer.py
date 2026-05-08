@@ -15,12 +15,13 @@ from tools.knowledge_retrieval import retrieve as retrieve_knowledge
 
 class OptimizerAgent(BaseAgent):
 
-    def __init__(self, llm_config=LLM_CONFIG, mock_mode: bool = None):
+    def __init__(self, llm_config=LLM_CONFIG, mock_mode: bool = None, best_of_n: int = 1):
         super().__init__("OptimizerAgent", llm_config)
         if mock_mode is None:
             mock_mode = SYS_CONFIG.mock_profiling
         self.mock_mode = mock_mode
         self.min_improvement = SYS_CONFIG.min_improvement_threshold
+        self.best_of_n = max(1, best_of_n)
 
     def execute(
         self,
@@ -30,80 +31,108 @@ class OptimizerAgent(BaseAgent):
         bottleneck_ir: Optional[Dict[str, BottleneckItem]] = None,
     ) -> OptimizationResult:
 
-        self.logger.info(f"Starting optimization with {len(strategies)} strategies...")
+        n = self.best_of_n
+        bon_tag = f" (Best-of-{n})" if n > 1 else ""
+        self.logger.info(f"Starting optimization with {len(strategies)} strategies{bon_tag}...")
 
         best_code = kernel_code
         best_time = baseline_time_ms
         history: List[OptimizationHistory] = []
 
         for i, strategy in enumerate(strategies):
-            self.logger.info(f"  [{i+1}/{len(strategies)}] Trying: {strategy}")
+            self.logger.info(f"  [{i+1}/{len(strategies)}] Trying: {strategy}{bon_tag}")
 
-            # 1. 让 LLM 生成优化后的代码（传入结构化 IR 以构建 hardware-aware prompt）
-            optimized_code = self._generate_optimized_code(best_code, strategy, bottleneck_ir)
-            if not optimized_code:
-                self.logger.warning(f"    LLM returned empty code for strategy: {strategy}")
+            # 1. 生成 N 个候选（Best-of-N TTS）
+            candidates = self._generate_n_candidates(best_code, strategy, bottleneck_ir, n)
+            if not candidates:
+                self.logger.warning(f"    LLM returned no candidates for strategy: {strategy}")
                 continue
 
-            # 2. 编译 + 测评（支持 self-repair 最多 2 次）
+            # 2. 逐候选编译 + 测评，记录最优
             MAX_REPAIR = 2
-            test_result = None
-            for repair_attempt in range(MAX_REPAIR + 1):
-                try:
-                    if self.mock_mode:
-                        test_result = mock_profile(optimized_code)
-                    else:
-                        test_result = compile_and_test(optimized_code)
-                except Exception as e:
-                    self.logger.warning(f"    Test failed: {e}")
-                    break
+            best_candidate_code = None
+            best_candidate_time = float("inf")
+            best_candidate_idx = -1
+            any_success = False
 
-                if test_result.success:
-                    break
+            for ci, optimized_code in enumerate(candidates):
+                if n > 1:
+                    self.logger.info(f"    Candidate {ci+1}/{len(candidates)}...")
 
-                # 编译失败 → self-repair
-                if repair_attempt < MAX_REPAIR:
-                    self.logger.info(
-                        f"    Compile error (attempt {repair_attempt+1}/{MAX_REPAIR}), trying self-repair..."
-                    )
-                    repaired = self._repair_code(optimized_code, test_result.error)
-                    if repaired:
-                        optimized_code = repaired
-                    else:
-                        self.logger.warning("    Self-repair returned empty code, giving up")
+                test_result = None
+                for repair_attempt in range(MAX_REPAIR + 1):
+                    try:
+                        if self.mock_mode:
+                            test_result = mock_profile(optimized_code)
+                        else:
+                            test_result = compile_and_test(optimized_code)
+                    except Exception as e:
+                        self.logger.warning(f"    Test failed: {e}")
                         break
-                else:
-                    self.logger.warning(
-                        f"    Compile/run failed after {MAX_REPAIR} repair attempts: {test_result.error[:120]}"
-                    )
 
-            if test_result is None or not test_result.success:
+                    if test_result.success:
+                        break
+
+                    # 编译失败 → self-repair
+                    if repair_attempt < MAX_REPAIR:
+                        self.logger.info(
+                            f"    Compile error (attempt {repair_attempt+1}/{MAX_REPAIR}), trying self-repair..."
+                        )
+                        repaired = self._repair_code(optimized_code, test_result.error)
+                        if repaired:
+                            optimized_code = repaired
+                        else:
+                            self.logger.warning("    Self-repair returned empty code, giving up")
+                            break
+                    else:
+                        self.logger.warning(
+                            f"    Compile/run failed after {MAX_REPAIR} repair attempts: {test_result.error[:120]}"
+                        )
+
+                if test_result is None or not test_result.success:
+                    if n > 1:
+                        self.logger.info(f"    Candidate {ci+1}: compile/run failed, skipping")
+                    continue
+
+                exec_time = test_result.exec_time_ms
+                # 异常检测
+                if baseline_time_ms > 0 and exec_time > baseline_time_ms * 10:
+                    if n > 1:
+                        self.logger.info(
+                            f"    Candidate {ci+1}: anomalous slowdown ({exec_time:.1f}ms), skipping"
+                        )
+                    continue
+
+                any_success = True
+                if n > 1:
+                    self.logger.info(f"    Candidate {ci+1}: {exec_time:.2f} ms")
+
+                if exec_time < best_candidate_time:
+                    best_candidate_time = exec_time
+                    best_candidate_code = optimized_code
+                    best_candidate_idx = ci
+
+            # 3. 所有候选都失败
+            if not any_success:
                 history.append(OptimizationHistory(
                     strategy=strategy,
                     speedup=0.0,
                     exec_time_ms=0.0,
-                    code=optimized_code,
+                    code=candidates[0],
                     success=False,
+                    candidates_tried=len(candidates),
+                    best_candidate_idx=0,
                 ))
                 continue
 
-            # 3. 计算提升
-            exec_time = test_result.exec_time_ms
+            # 4. 计算提升（以 best_candidate 为准）
+            exec_time = best_candidate_time
+            optimized_code = best_candidate_code
 
-            # 异常检测：如果结果比 baseline 慢 10 倍以上，直接拒绝
-            if baseline_time_ms > 0 and exec_time > baseline_time_ms * 10:
-                self.logger.warning(
-                    f"    ✗ Anomalous slowdown detected: {exec_time:.2f}ms vs baseline {baseline_time_ms:.2f}ms "
-                    f"({exec_time/baseline_time_ms:.0f}x slower). Skipping."
+            if n > 1:
+                self.logger.info(
+                    f"    Best candidate: #{best_candidate_idx+1} → {exec_time:.2f} ms"
                 )
-                history.append(OptimizationHistory(
-                    strategy=strategy,
-                    speedup=0.0,
-                    exec_time_ms=exec_time,
-                    code=optimized_code,
-                    success=False,
-                ))
-                continue
 
             if best_time > 0:
                 improvement = (best_time - exec_time) / best_time
@@ -116,12 +145,14 @@ class OptimizerAgent(BaseAgent):
                 exec_time_ms=exec_time,
                 code=optimized_code,
                 success=True,
+                candidates_tried=len(candidates),
+                best_candidate_idx=best_candidate_idx,
             )
             history.append(record)
 
             self.logger.info(f"    Time: {exec_time:.2f} ms  Improvement: {improvement*100:.1f}%")
 
-            # 4. 决策：超过阈值才保留
+            # 5. 决策：超过阈值才保留
             if improvement > self.min_improvement:
                 best_code = optimized_code
                 best_time = exec_time
@@ -182,6 +213,39 @@ class OptimizerAgent(BaseAgent):
         )
 
     # ─────────────────────────────────────────
+    # 内部：Best-of-N 候选生成
+    # ─────────────────────────────────────────
+
+    # 多样性提示词，让 N 个候选探索不同实现角度
+    _VARIANT_HINTS = [
+        "Use the most straightforward, readable implementation of this optimization.",
+        "Be aggressive: maximize performance, use every applicable trick (unrolling, ILP, vectorized loads).",
+        "Minimize register pressure while applying the optimization; prefer scalar over vector when it saves registers.",
+        "Focus on maximizing memory-level parallelism and hiding latency through software pipelining.",
+        "Prioritize occupancy: choose tile sizes and block dimensions that maximize active warps per SM.",
+    ]
+
+    def _generate_n_candidates(
+        self,
+        kernel_code: str,
+        strategy: str,
+        bottleneck_ir: Optional[Dict[str, BottleneckItem]],
+        n: int,
+    ) -> List[str]:
+        """生成 N 个多样化候选 kernel，供 Best-of-N 选取。"""
+        if n == 1:
+            code = self._generate_optimized_code(kernel_code, strategy, bottleneck_ir)
+            return [code] if code else []
+
+        candidates = []
+        for i in range(n):
+            hint = self._VARIANT_HINTS[i % len(self._VARIANT_HINTS)]
+            code = self._generate_optimized_code(kernel_code, strategy, bottleneck_ir, variant_hint=hint)
+            if code:
+                candidates.append(code)
+        return candidates
+
+    # ─────────────────────────────────────────
     # 内部：让 LLM 生成优化代码
     # ─────────────────────────────────────────
 
@@ -190,6 +254,7 @@ class OptimizerAgent(BaseAgent):
         kernel_code: str,
         strategy: str,
         bottleneck_ir: Optional[Dict[str, BottleneckItem]] = None,
+        variant_hint: str = "",
     ) -> str:
         # 1. 知识库检索相关示例
         example_code = retrieve_knowledge(strategy)
@@ -234,13 +299,15 @@ Study the above example carefully, especially the correct API usage and syntax.
 
                 ir_section = "\n".join(lines) + "\n"
 
+        variant_section = f"## Implementation Angle:\n{variant_hint}\n\n" if variant_hint else ""
+
         prompt = f"""
 You are a CUDA expert. Apply the following optimization to the CUDA kernel below.
 
 ## Optimization Goal:
 {strategy}
 
-{ir_section}{knowledge_section}## Current Kernel (may already contain prior optimizations — preserve them):
+{variant_section}{ir_section}{knowledge_section}## Current Kernel (may already contain prior optimizations — preserve them):
 ```cuda
 {kernel_code}
 ```

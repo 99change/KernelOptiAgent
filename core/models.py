@@ -126,6 +126,8 @@ class OptimizationHistory:
     exec_time_ms: float
     code: str
     success: bool
+    candidates_tried: int = 1    # Best-of-N: 总共生成了几个候选
+    best_candidate_idx: int = 0  # Best-of-N: 最优候选的序号（0-based）
 
 
 @dataclass

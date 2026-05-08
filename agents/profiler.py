@@ -37,7 +37,7 @@ class ProfilerAgent:
             return ProfileResult(
                 metrics=test_result.metrics or KernelMetrics(exec_time_ms=avg_time),
                 baseline_time_ms=avg_time,
-                hardware_profile=None,
+                hardware_profile=HardwareProfile(exec_time_ms=avg_time),
             )
 
         # ── 真实模式：完整 hardware profile ───────────────────
@@ -53,7 +53,7 @@ class ProfilerAgent:
             return ProfileResult(
                 metrics=test_result.metrics or KernelMetrics(exec_time_ms=avg_time),
                 baseline_time_ms=avg_time,
-                hardware_profile=None,
+                hardware_profile=HardwareProfile(exec_time_ms=avg_time),
             )
 
         ptxas = compile_result.ptxas_info

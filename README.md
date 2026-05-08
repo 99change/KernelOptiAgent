@@ -53,11 +53,12 @@ Input Kernel Code
   → BottleneckIR { non_coalesced_memory: {score, evidence}, ... }
   → strategies（按 score 排序，score >= 0.4 激活）
         ↓
-  [OptimizerAgent]
+  [OptimizerAgent]                            (--best-of-n N 控制每策略候选数)
   ├─ For each strategy:
   │  ├─ knowledge_retrieval(strategy) → 注入示例代码
-  │  ├─ LLM 改写代码（hardware-aware prompt）
-  │  ├─ 编译 + 实测，编译失败最多 2 次 self-repair
+  │  ├─ [Best-of-N] LLM 生成 N 个变体（每个注入不同实现角度 hint）
+  │  ├─ 逐候选编译 + 实测，编译失败最多 2 次 self-repair
+  │  ├─ 选最快候选（nvcc 实测即 Verifier，无需 Reward Model）
   │  ├─ 异常检测（>10x 慢则丢弃）
   │  └─ improvement > 5% 才保留
   ├─ E2E pass：无约束让 LLM 自由优化，与策略结果竞争
@@ -123,8 +124,15 @@ LLM 不写自由文本，只填固定 schema 的 JSON，每个字段输出 `scor
 ```bash
 export DASHSCOPE_API_KEY=your_key
 
+# 默认单次生成
 python main.py --input examples/vector_add.cu
-python main.py --input your_kernel.cu --model qwen-max --rounds 5
+python main.py --input your_kernel.cu --model qwen3.5-flash-2026-02-23 --rounds 5
+
+# Best-of-N TTS：每策略生成 3 个变体，取最快
+python main.py --input your_kernel.cu --best-of-n 3
+
+# Mock 模式（无 GPU，仅跑 LLM 验证逻辑）
+python main.py --input your_kernel.cu --mock
 ```
 
 ---
@@ -138,12 +146,12 @@ python main.py --input your_kernel.cu --model qwen-max --rounds 5
 - **流程顺序调整**：Profiler 先跑，Analyzer 拿到硬件数据后再分析（原来是 Analyzer 先跑，手里没有任何硬件数据）
 - **Self-repair**：编译失败时 LLM 最多自动修复 2 次
 - **异常检测**：>10x 慢的结果自动拒绝
+- **Best-of-N TTS**：`--best-of-n N` 参数控制每策略候选数，注入多样化实现角度 hint（straightforward / aggressive / register-focused / latency-hiding / occupancy-focused），`nvcc` 实测 speedup 直接作为 Verifier 选优，无需训练 Reward Model
 
 ### 📋 下一步
 
 - **Optimizer CoT 规划**：代码生成前让 LLM 先输出结构化修改方案（tile size、unroll factor 等），再按方案编码，便于 ablation "有规划 vs 无规划"
-- **Best-of-N TTS**：同一策略生成 N 个变体，取最优。`nvcc` 编译 + 实测 speedup 本身就是完美 Verifier，无需训练 Reward Model
-- **KernelBench 批量实验**：选 20-30 个 kernel，报告 speedup 分布；与 `baseline_e2e.py` 对比作为 ablation
+- **KernelBench 批量实验**：选 20-30 个 kernel，报告 speedup 分布；与 `baseline_e2e.py` 对比作为 ablation；以及 Best-of-N 有无对比
 
 ---
 
@@ -153,7 +161,8 @@ python main.py --input your_kernel.cu --model qwen-max --rounds 5
 
 | TTS 要素 | 本项目中的对应物 |
 |----------|----------------|
-| 候选生成（Best-of-N） | 同一策略让 LLM 生成 N 种变体 |
+| 候选生成（Best-of-N） | `--best-of-n N`，同一策略生成 N 个变体，注入多样化 hint |
+| 多样性来源 | 5 种实现角度 hint（保守 / 激进 / 省寄存器 / 流水线 / 高占用率） |
 | Verifier | `nvcc` 编译通过 + 实测 speedup（无需训练） |
 | 搜索策略 | 当前贪心串行；可升级为 beam search |
-| 计算预算控制 | 最多尝试 K 次，或总时间上限 T 秒 |
+| 计算预算控制 | `--best-of-n N` 直接控制每策略 LLM 调用次数 |

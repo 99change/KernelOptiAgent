@@ -1,23 +1,34 @@
 /*
  * ================================================================
  *  KernelOptiAgent - Optimization Summary
- *  Generated : 2026-05-08 14:40:57
+ *  Generated : 2026-05-08 19:39:35
  * ================================================================
  *
- *  Baseline time  : 91.871 ms
- *  Optimized time : 62.000 ms
- *  Total speedup  : 32.5%
+ *  Baseline time  : 17.950 ms
+ *  Optimized time : 17.950 ms
+ *  Total speedup  : 0.0%
  *
  *  Bottlenecks identified:
- *    - shared_memory_underused (score=0.97, evidence: smem_bytes=0, data_reuse_possible=True)
- *    - non_coalesced_memory (score=0.70, evidence: access_pattern=strided)
+ *    - low_occupancy (score=1.00, evidence: achieved_occupancy_pct=0.0, registers=0)
+ *    - compute_underutilized (score=1.00, evidence: compute_throughput_pct=0.0)
+ *    - shared_memory_underused (score=1.00, evidence: smem_bytes=0, data_reuse_possible=True)
+ *    - non_coalesced_memory (score=0.93, evidence: access_pattern=strided)
  *
  *  Changes applied:
- *    [1] Tile global memory accesses through shared memory to exploit data reuse
- *    [2] Coalesce memory access so consecutive threads access consecutive addresses
+ *    [1] Tune block size and reduce register/shared memory usage to raise occupancy
  *
  * ================================================================
  */
+/*
+ * matmul_naive.cu
+ * 一个完全未优化的矩阵乘法，有更多的优化空间（比 vector_add 更有挑战性）。
+ *
+ * 主要问题：
+ * 1. 没有 shared memory tiling（大量重复的 global memory 访问）
+ * 2. 内存访问 stride 不是最优的
+ * 3. 没有向量化读取
+ */
+
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,45 +36,17 @@
 #define M 4096
 #define K 4096
 #define N 4096
-#define TILE_SIZE 16
 
-// Optimized matrix multiplication kernel using shared memory tiling
-__global__ void matmul_tiled(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    float* __restrict__ C,
-    int m, int k, int n)
-{
-    // Declare shared memory tiles
-    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
-    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
-
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    float sum = 0.0f;
-
-    // Iterate over tiles along the K dimension
-    for (int t = 0; t < (k + TILE_SIZE - 1) / TILE_SIZE; t++) {
-        // Each thread cooperates to load elements into shared memory
-        int aCol = t * TILE_SIZE + threadIdx.x;
-        int bRow = t * TILE_SIZE + threadIdx.y;
-
-        tileA[threadIdx.y][threadIdx.x] = (row < m && aCol < k) ? A[row * k + aCol] : 0.0f;
-        tileB[threadIdx.y][threadIdx.x] = (bRow < k && col < n) ? B[bRow * n + col] : 0.0f;
-
-        // Synchronize to ensure all threads have finished loading
-        __syncthreads();
-
-        // Perform dot product for the current tile
-        for (int i = 0; i < TILE_SIZE; i++) {
-            sum += tileA[threadIdx.y][i] * tileB[i][threadIdx.x];
-        }
-
-        // Synchronize before loading the next tile to prevent overwriting
-        __syncthreads();
-    }
+// 最朴素的矩阵乘法 kernel
+__global__ void matmul_naive(float *A, float *B, float *C, int m, int k, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (row < m && col < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < k; i++) {
+            sum += A[row * k + i] * B[i * n + col];
+        }
         C[row * n + col] = sum;
     }
 }
@@ -79,7 +62,6 @@ int main() {
     h_B = (float*)malloc(size_B);
     h_C = (float*)malloc(size_C);
 
-    // Initialize host data
     for (int i = 0; i < M * K; i++) h_A[i] = (float)(rand() % 10) / 10.0f;
     for (int i = 0; i < K * N; i++) h_B[i] = (float)(rand() % 10) / 10.0f;
 
@@ -90,15 +72,15 @@ int main() {
     cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice);
 
-    dim3 blockDim(TILE_SIZE, TILE_SIZE);
-    dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    dim3 blockDim(16, 16);
+    dim3 gridDim((N + 15) / 16, (M + 15) / 16);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    matmul_tiled<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, K, N);
+    matmul_naive<<<gridDim, blockDim>>>(d_A, d_B, d_C, M, K, N);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);

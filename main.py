@@ -41,7 +41,7 @@ def setup_logging(verbose: bool = False):
 # 核心流程
 # ─────────────────────────────────────────────
 
-def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: LLMConfig = None) -> OptimizationReport:
+def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: LLMConfig = None, best_of_n: int = 1) -> OptimizationReport:
     """
     主优化流程：分析 → 测评 → 优化 → 返回报告
 
@@ -113,7 +113,7 @@ def run(kernel_code: str, mock: bool = False, max_rounds: int = 5, llm_config: L
     print(separator)
 
     strategies = analysis.strategies[:max_rounds]
-    optimizer = OptimizerAgent(llm_config=llm_config, mock_mode=mock)
+    optimizer = OptimizerAgent(llm_config=llm_config, mock_mode=mock, best_of_n=best_of_n)
     optimization = optimizer.execute(
         kernel_code=kernel_code,
         strategies=strategies,
@@ -243,6 +243,14 @@ def parse_args():
         help="Qwen model name (default: qwen-max)",
     )
     parser.add_argument(
+        "--best-of-n", "-N",
+        type=int,
+        default=1,
+        dest="best_of_n",
+        metavar="N",
+        help="Generate N candidates per strategy (TTS), keep fastest (default: 1)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
@@ -281,6 +289,8 @@ def main():
     print(f"Model  : {llm_config.model}")
     print(f"Mock   : {args.mock}")
     print(f"Rounds : {args.rounds}")
+    if args.best_of_n > 1:
+        print(f"Best-of-N: {args.best_of_n} candidates/strategy")
 
     # 运行优化
     report = run(
@@ -288,6 +298,7 @@ def main():
         mock=args.mock,
         max_rounds=args.rounds,
         llm_config=llm_config,
+        best_of_n=args.best_of_n,
     )
 
     # 保存结果

@@ -1,14 +1,15 @@
 GPU Kernel Optimization Report
 ============================================================
 
-Baseline time    : 91.87 ms
-Optimized time   : 62.00 ms
-Speedup          : 32.5%
+Baseline time    : 17.95 ms
+Optimized time   : 17.95 ms
+Speedup          : 0.0%
 
 Bottlenecks identified:
-  - shared_memory_underused (score=0.97, evidence: smem_bytes=0, data_reuse_possible=True)
-  - non_coalesced_memory (score=0.70, evidence: access_pattern=strided)
+  - low_occupancy (score=1.00, evidence: achieved_occupancy_pct=0.0, registers=0)
+  - compute_underutilized (score=1.00, evidence: compute_throughput_pct=0.0)
+  - shared_memory_underused (score=1.00, evidence: smem_bytes=0, data_reuse_possible=True)
+  - non_coalesced_memory (score=0.93, evidence: access_pattern=strided)
 
 Strategies applied:
-  - Tile global memory accesses through shared memory to exploit data reuse
-  - Coalesce memory access so consecutive threads access consecutive addresses
+  - Tune block size and reduce register/shared memory usage to raise occupancy
