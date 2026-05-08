@@ -7,7 +7,7 @@ DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 @dataclass
 class LLMConfig:
     """LLM 客户端配置（仅支持 Qwen / Dashscope）"""
-    model: str = "qwen-max"
+    model: str = "qwen3.5-flash-2026-02-23"
     temperature: float = 0.2
     max_tokens: int = 4096
     api_key: str = ""

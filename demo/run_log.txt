@@ -1,0 +1,91 @@
+# KernelOptiAgent Demo — GEMM Optimization
+# Date     : 2026-05-08 14:41
+# Input    : demo/input_kernel.cu  (naive matmul, 4096x4096x4096, float32)
+# GPU      : NVIDIA GeForce RTX 5070 Ti Laptop GPU
+# Model    : qwen3.5-flash-2026-02-23 (Dashscope)
+# Rounds   : 5
+#
+# Result   : 91.871 ms → 62.00 ms  (+32.5% speedup)
+# Strategy : shared memory tiling (accepted) + coalesce (rejected, -17.1%)
+# E2E pass : 92.97 ms (not better than strategy pass)
+# ============================================================
+
+14:33:40 [Agent.ProfilerAgent] INFO: Profiling kernel (mock_mode=False)...
+14:33:40 [Agent.ProfilerAgent] INFO:   [1/3] Compiling + parsing ptxas info...
+14:33:41 [Agent.ProfilerAgent] INFO:   ptxas: registers=37, smem=0B, spill_stores=0B
+14:33:41 [Agent.ProfilerAgent] INFO:   [2/3] Timing kernel (3 runs avg)...
+14:33:44 [Agent.ProfilerAgent] INFO:   Baseline time: 91.871 ms
+14:33:44 [Agent.ProfilerAgent] INFO:   [3/3] Running ncu to collect GPU metrics (this may take ~30s)...
+14:33:49 [Agent.ProfilerAgent] INFO:   ncu: mem_throughput=86.0%, compute=86.0%, occupancy=99.6%
+14:33:49 [Agent.AnalyzerAgent] INFO: Starting kernel analysis (hardware-grounded IR mode)...
+14:34:32 [httpx] INFO: HTTP Request: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+14:35:22 [httpx] INFO: HTTP Request: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+14:36:09 [httpx] INFO: HTTP Request: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+14:36:09 [Agent.AnalyzerAgent] INFO: Found 2 active bottlenecks (threshold=0.4, aggregations=3)
+14:36:09 [Agent.OptimizerAgent] INFO: Starting optimization with 2 strategies...
+14:36:09 [Agent.OptimizerAgent] INFO:   [1/2] Trying: Tile global memory accesses through shared memory to exploit data reuse
+14:37:06 [httpx] INFO: HTTP Request: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+14:37:10 [Agent.OptimizerAgent] INFO:     Time: 62.00 ms  Improvement: 32.5%
+14:37:10 [Agent.OptimizerAgent] INFO:     ✓ Accepted (improvement=32.5%)
+14:37:10 [Agent.OptimizerAgent] INFO:   [2/2] Trying: Coalesce memory access so consecutive threads access consecutive addresses
+14:39:08 [httpx] INFO: HTTP Request: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+14:39:11 [Agent.OptimizerAgent] INFO:     Time: 72.61 ms  Improvement: -17.1%
+14:39:11 [Agent.OptimizerAgent] INFO:     ✗ Rejected (below threshold 5%)
+14:39:11 [Agent.OptimizerAgent] INFO:   [E2E] Trying: end-to-end unconstrained optimization
+14:40:54 [httpx] INFO: HTTP Request: POST https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions "HTTP/1.1 200 OK"
+14:40:57 [Agent.OptimizerAgent] INFO:     Time: 92.97 ms  vs baseline: -1.2%
+14:40:57 [Agent.OptimizerAgent] INFO:     ~ E2E result not better than strategy pass
+14:40:57 [Agent.OptimizerAgent] INFO: Optimization complete. Total speedup: 32.5%
+
+
+Input  : demo/input_kernel.cu
+Output : ./results
+Model  : qwen3.5-flash-2026-02-23
+Mock   : False
+Rounds : 5
+
+============================================================
+  Phase 1/3 : Profiling Baseline (ptxas + ncu + timing)
+============================================================
+  Baseline time        : 91.871 ms
+  Registers/thread     : 37
+  Static shared mem    : 0 bytes
+  Register spill       : 0 bytes ✓
+  Mem Throughput       : 86.0% of peak
+  Compute Throughput   : 86.0% of peak
+  DRAM Throughput      : 15.6% of peak
+  Achieved Occupancy   : 99.6%
+
+============================================================
+  Phase 2/3 : Analyzing Kernel (hardware-grounded IR)
+============================================================
+  Bottleneck IR (8 types assessed):
+    shared_memory_underused      [█████████░] 0.97 ◀ active
+    non_coalesced_memory         [███████░░░] 0.70 ◀ active
+    warp_divergence              [█░░░░░░░░░] 0.13
+    high_register_pressure       [█░░░░░░░░░] 0.10
+    memory_bound                 [░░░░░░░░░░] 0.07
+    compute_underutilized        [░░░░░░░░░░] 0.07
+    memory_latency_bound         [░░░░░░░░░░] 0.07
+    low_occupancy                [░░░░░░░░░░] 0.00
+  Strategies proposed  : 2
+    - Tile global memory accesses through shared memory to exploit data reuse
+    - Coalesce memory access so consecutive threads access consecutive addresses
+
+============================================================
+  Phase 3/3 : Optimizing
+============================================================
+
+  Strategies tried     : 2
+  Strategies succeeded : 2
+  E2E pass             : 92.97 ms  (-1.2% vs baseline)
+  Total speedup        : 32.5%
+
+============================================================
+  Done!
+============================================================
+  Speedup        : 32.5%
+  Optimized code : ./results/optimized_kernel.cu
+  Report         : ./results/optimization_report.txt
+
+

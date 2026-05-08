@@ -1,8 +1,9 @@
-# KernelOptiAgent（已上线部分）
+# KernelOptiAgent
 
 自动优化 CUDA kernel 的 3-Agent 系统。输入 naive kernel，输出带注释的优化版本。
 
-> 目前只是一个单kernel优化的agent，问题在于这个想法已经严重过时，简单的单算子优化方式被kernel fusion的能力覆盖
+核心思路：用 `nvcc --ptxas-options=-v` + `ncu` 采集真实硬件数据，驱动 LLM 做 hardware-grounded 的瓶颈分析，替代"让 LLM 读代码猜瓶颈"的做法。
+
 ---
 
 ## 项目结构
@@ -10,26 +11,26 @@
 ```
 KernelOptiAgent/
 ├── agents/
-│   ├── base.py              # Agent 基类
-│   ├── analyzer.py          # 瓶颈分析 Agent
-│   ├── profiler.py          # 基准测评 Agent
+│   ├── base.py              # Agent 基类（LLM 调用封装）
+│   ├── profiler.py          # 硬件 Profiling Agent（纯工具流，零 LLM）
+│   ├── analyzer.py          # 瓶颈分析 Agent（LLM 填表，以硬件数据为输入）
 │   └── optimizer.py         # 优化执行 Agent
 ├── tools/
-│   ├── kernel_tools.py      # nvcc 编译 + GPU 测评
+│   ├── kernel_tools.py      # nvcc 编译 + ptxas 解析 + ncu 采集 + 计时
 │   └── knowledge_retrieval.py  # strategy → 示例代码检索
 ├── knowledge/               # CUDA 优化模式示例库
-│   ├── float4_vectorized.cu     # float4 向量化 + __ldg 正确用法
-│   ├── latency_hiding.cu        # 延迟隐藏：__ldg / ILP / 软件流水线
-│   ├── shared_memory_tiling.cu  # Tiled matmul / shared memory 数据复用
-│   ├── loop_unrolling.cu        # #pragma unroll
-│   ├── occupancy_tuning.cu      # __launch_bounds__ / block size 调优
-│   └── restrict_qualifiers.cu   # __restrict__ 指针别名消除
+│   ├── float4_vectorized.cu
+│   ├── latency_hiding.cu
+│   ├── shared_memory_tiling.cu
+│   ├── loop_unrolling.cu
+│   ├── occupancy_tuning.cu
+│   └── restrict_qualifiers.cu
 ├── core/
-│   ├── models.py            # 数据模型（含 BottleneckIR）
+│   ├── models.py            # 数据模型（HardwareProfile / BottleneckIR）
 │   ├── config.py            # LLM 配置（Qwen / Dashscope）
 │   └── memory.py
 ├── main.py                  # 主入口
-├── baseline_e2e.py/         # 端到端对比
+├── baseline_e2e.py          # 端到端 baseline 对比（裸 LLM 直接改）
 └── results/                 # 输出目录
 ```
 
@@ -40,23 +41,26 @@ KernelOptiAgent/
 ```
 Input Kernel Code
         ↓
+  [ProfilerAgent]  ← 纯工具流，零 LLM
+  ├─ nvcc --ptxas-options=-v → PtxasInfo { registers, smem_bytes, spill }
+  ├─ 编译 + 3次计时 → baseline_time_ms
+  └─ ncu → NcuMetrics { memory_throughput%, compute_throughput%, dram%, occupancy% }
+  → HardwareProfile
+        ↓
   [AnalyzerAgent]
+  - 将 HardwareProfile 真实数字注入 prompt
   - LLM 以"填表"方式输出 BottleneckIR（固定 schema，跑 3 次取均值）
   → BottleneckIR { non_coalesced_memory: {score, evidence}, ... }
-  → strategies（按 score 排序）
-        ↓
-  [ProfilerAgent]  ← 纯工具流，无 LLM
-  - 编译 + GPU 实测
-  → baseline_time_ms
+  → strategies（按 score 排序，score >= 0.4 激活）
         ↓
   [OptimizerAgent]
-  ├─ For each strategy (按 score 排序):
+  ├─ For each strategy:
   │  ├─ knowledge_retrieval(strategy) → 注入示例代码
-  │  ├─ 构建 hardware-aware prompt（IR score + constraints + 示例）
-  │  ├─ LLM 改写代码
-  │  ├─ 编译 + 实测
+  │  ├─ LLM 改写代码（hardware-aware prompt）
+  │  ├─ 编译 + 实测，编译失败最多 2 次 self-repair
   │  ├─ 异常检测（>10x 慢则丢弃）
-  │  └─ 超过阈值才保留
+  │  └─ improvement > 5% 才保留
+  ├─ E2E pass：无约束让 LLM 自由优化，与策略结果竞争
   → best optimized_code + speedup
         ↓
 Output: results/optimized_kernel.cu（含修改说明注释）+ report
@@ -64,37 +68,59 @@ Output: results/optimized_kernel.cu（含修改说明注释）+ report
 
 ---
 
-## Structured Bottleneck IR
+## HardwareProfile 数据结构
 
-LLM 不写自由文本描述瓶颈，而是填写固定 schema 的 JSON，每个字段输出 `score`（0~1）和 `evidence`：
+`ProfilerAgent` 一次采集，产出两类数据：
+
+**PtxasInfo（编译期，来自 `nvcc --ptxas-options=-v` stderr）**
 
 | 字段 | 含义 |
 |------|------|
-| `non_coalesced_memory` | 非合并访存 |
-| `memory_bound` | 内存带宽瓶颈 |
-| `low_occupancy` | GPU 占用率低 |
-| `high_register_pressure` | 寄存器压力大 |
-| `warp_divergence` | Warp 分支分歧 |
-| `compute_underutilized` | 计算资源未充分利用 |
-| `shared_memory_underused` | Shared memory 未利用 |
-| `memory_latency_bound` | 内存延迟瓶颈 |
+| `registers` | 每线程寄存器数 |
+| `smem_bytes` | 静态 shared memory 字节 |
+| `spill_stores` / `spill_loads` | 寄存器 spill 到 local memory 的量 |
+
+**NcuMetrics（运行时，来自 `ncu --metrics ...`）**
+
+| 字段 | 含义 |
+|------|------|
+| `memory_throughput_pct` | 整体内存吞吐 % of peak |
+| `compute_throughput_pct` | SM 计算吞吐 % of peak |
+| `dram_throughput_pct` | DRAM 带宽 % of peak |
+| `l2_throughput_pct` | L2 Cache 吞吐 % of peak |
+| `achieved_occupancy_pct` | 实际 warp occupancy % |
+
+---
+
+## Structured Bottleneck IR
+
+LLM 不写自由文本，只填固定 schema 的 JSON，每个字段输出 `score`（0~1）和 `evidence`（含真实测量值）：
+
+| 字段 | 含义 | 主要依据 |
+|------|------|---------|
+| `non_coalesced_memory` | 非合并访存 | 代码访问模式 |
+| `memory_bound` | 内存带宽瓶颈 | `memory_throughput_pct` |
+| `low_occupancy` | GPU 占用率低 | `achieved_occupancy_pct` + `registers` |
+| `high_register_pressure` | 寄存器压力大 | `registers` + `spill_stores` |
+| `warp_divergence` | Warp 分支分歧 | 代码 branch 结构 |
+| `compute_underutilized` | 计算资源未充分利用 | `compute_throughput_pct` |
+| `shared_memory_underused` | Shared memory 未利用 | `smem_bytes` + 代码 |
+| `memory_latency_bound` | 内存延迟瓶颈 | `memory_throughput_pct` vs `compute_throughput_pct` |
 
 - **3 次聚合**：同一 kernel 跑 LLM 3 次，score 取均值，防止单次不稳定
 - **阈值激活**：`score >= 0.4` 才触发对应优化策略
-- **约束推导**：高 score 的瓶颈影响 prompt 约束（如 `high_register_pressure` 高 → 提示 LLM 避免新增变量）
 
 ---
 
 ## 知识库注入
 
-`OptimizerAgent` 构建 prompt 时，按策略关键词检索 `knowledge/` 目录中的示例代码并注入，让 LLM 做"代码改写"而非"知识发明"。每个示例文件带详细注释，包含常见错误用法说明（如 `__ldg` 必须传指针而非值）。
+`OptimizerAgent` 构建 prompt 时，按策略关键词检索 `knowledge/` 目录中的示例代码并注入，让 LLM 做"代码改写"而非"知识发明"。
 
 ---
 
 ## 快速上手
 
 ```bash
-# 需要环境变量
 export DASHSCOPE_API_KEY=your_key
 
 python main.py --input examples/vector_add.cu
@@ -103,54 +129,31 @@ python main.py --input your_kernel.cu --model qwen-max --rounds 5
 
 ---
 
-# 待完成
+## 当前进度
 
-## 优先级 P0（当前代码已知缺陷，需先修复）
+### ✅ 已完成
 
-### 1. Analyzer：替换假静态分析工具
-当前 `analyze_syntax` / `detect_memory_pattern` / `estimate_parallelism` 均为正则手写，信息量极低（大量结果为 `unknown` / `N/A`），不如不传。
+- **Profiler 纯工具流**：零 LLM，三步流水线（ptxas → 计时 → ncu），输出完整 `HardwareProfile`
+- **Hardware-grounded Analyzer**：删除所有正则假静态分析，LLM prompt 直接注入真实测量数字；evidence 字段写实测值而非代码猜测
+- **流程顺序调整**：Profiler 先跑，Analyzer 拿到硬件数据后再分析（原来是 Analyzer 先跑，手里没有任何硬件数据）
+- **Self-repair**：编译失败时 LLM 最多自动修复 2 次
+- **异常检测**：>10x 慢的结果自动拒绝
 
-**替换目标：**
-- 用 `nvcc --ptxas-options=-v` 编译输出提取**寄存器数量、shared memory 用量、spill 情况**
-- 集成 `ncu`（Nsight Compute CLI）获取**memory throughput、occupancy、warp efficiency、arithmetic intensity**
-- 这些数值是 LLM 读代码无法推断的，才是静态工具对 BottleneckIR 的真实贡献
+### 📋 下一步
 
-### ~~2. Profiler：去除 LLM 调用，改为纯工具流~~ ✅ 已完成
-`ProfilerAgent` 已从 `BaseAgent` 中独立，不再继承 LLM 基类，不再调用 `_think`。
-`execute()` 直接返回 `ProfileResult`（含 `baseline_time_ms` + `metrics`）。
-`bottleneck_description` 字段保留但为空字符串，仅用于向后兼容；瓶颈分析统一由 AnalyzerAgent 的 BottleneckIR 负责。
-
-### 3. Optimizer：添加 Chain-of-Thought 规划步骤
-当前 `_generate_optimized_code` 让 LLM 一步直接输出代码，策略意图和代码实现混在一个 prompt 里，容易导致幻觉或策略未实际落地。
-
-**改造目标：**
-- 在代码生成前增加一步"规划 prompt"：让 LLM 先输出结构化修改方案（改哪个变量、tile size 取多少、unroll factor 是多少等），作为中间推理步骤
-- 再用规划方案 + 原始代码构建"编码 prompt"，LLM 只负责按方案机械改写
-- 规划输出可记录到 `OptimizationHistory`，便于 debug 策略是否真正被执行
+- **Optimizer CoT 规划**：代码生成前让 LLM 先输出结构化修改方案（tile size、unroll factor 等），再按方案编码，便于 ablation "有规划 vs 无规划"
+- **Best-of-N TTS**：同一策略生成 N 个变体，取最优。`nvcc` 编译 + 实测 speedup 本身就是完美 Verifier，无需训练 Reward Model
+- **KernelBench 批量实验**：选 20-30 个 kernel，报告 speedup 分布；与 `baseline_e2e.py` 对比作为 ablation
 
 ---
 
 ## Test-Time Scaling
 
-> 核心洞察：训练时模型固定，但推理时投入更多计算量可持续提升效果。
-> 本项目天然适合 TTS——`nvcc` 编译 + GPU 实测 speedup 本身就是完美的 Verifier，无需训练 Reward Model。
+本项目天然适合 TTS——GPU 实测 speedup 本身就是完美的 Verifier。
 
 | TTS 要素 | 本项目中的对应物 |
 |----------|----------------|
 | 候选生成（Best-of-N） | 同一策略让 LLM 生成 N 种变体 |
 | Verifier | `nvcc` 编译通过 + 实测 speedup（无需训练） |
-| 搜索策略 | 当前贪心串行；可升级为 MCTS / Beam Search |
+| 搜索策略 | 当前贪心串行；可升级为 beam search |
 | 计算预算控制 | 最多尝试 K 次，或总时间上限 T 秒 |
-
-**Best-of-N（最易落地）**：同一策略生成 N 个变体，全部编译测评，取最优保留。计算量增加 N 倍，优化质量可观提升，不需要改模型。
-
-**Profile 数据反馈**：将 ProfilerAgent 的 bandwidth/occupancy 等指标传入 OptimizerAgent prompt，基于具体数字选策略而非静态分析。
-
-## Phase 2（关键跃迁）
-
-* 收集数据：
-
-  * (Nsight → bottleneck)
-* 训练 classifier（替代 LLM）
-
----
