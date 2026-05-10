@@ -151,7 +151,56 @@ python main.py --input your_kernel.cu --mock
 ### 📋 下一步
 
 - **Optimizer CoT 规划**：代码生成前让 LLM 先输出结构化修改方案（tile size、unroll factor 等），再按方案编码，便于 ablation "有规划 vs 无规划"
-- **KernelBench 批量实验**：选 20-30 个 kernel，报告 speedup 分布；与 `baseline_e2e.py` 对比作为 ablation；以及 Best-of-N 有无对比
+- **更多 kernel 实验**：使用已有基准扩大测试集，持续更新结果
+
+---
+
+## KernelBench Level-1 实验
+
+### 实验基准集
+
+| Kernel | 类别 | 问题规模 |
+|--------|------|---------|
+| GEMM | 线性代数 | 1024×1024 fp32 |
+| Row-wise Softmax | 归约 | 4096×1024 fp32 |
+| Layer Norm | 复合归约 | 4096×1024 fp32 |
+| Matrix Transpose | 内存访问模式 | 4096×4096 fp32 |
+| Vector Add | 逐元素二元 | 16M 元素 fp32 |
+| ReLU | 逐元素一元 | 33.5M 元素 fp32 |
+
+naive CUDA 实现均位于 `benchmarks/` 和 `examples/` 目录。
+
+### 批量实验脚本
+
+```bash
+# 运行全部 6 个 kernel（两个系统），约需 1-2 小时
+python run_experiments.py
+
+# 只跑特定 kernel 的 KernelAgent
+python run_experiments.py --kernels softmax layernorm --skip-e2e --rounds 2
+
+# 只跑 E2E baseline
+python run_experiments.py --kernels relu softmax --skip-agent --baseline-tries 2
+
+# 验证文件是否存在
+python run_experiments.py --dry-run
+```
+
+结果保存到 `results/experiment_YYYYMMDD_HHMMSS.{csv,txt}`。
+
+### 当前实验结果（RTX 5070 Ti，Qwen3.5-Flash-2026-02-23）
+
+| Kernel | Baseline (ms) | KernelAgent 加速 | E2E Baseline 加速 |
+|--------|-------------|-----------------|-----------------|
+| GEMM 1024×1024 | 91.87 | **+32.5%** | +27.4% |
+| Softmax 4096×1024 | 0.460 | 运行中 | +0.0% |
+| Layer Norm 4096×1024 | 0.448 | 运行中 | **+87.9%** |
+| Matrix Transpose 4096×4096 | 0.428 | 运行中 | +22.8% |
+| ReLU 33.5M | 0.456 | 运行中 | +0.0% |
+| Vector Add 16M | 0.627 | 运行中 | +0.0% |
+| **平均（E2E）** | — | — | **+22.7%** (仅计 3/6 有改进的) |
+
+> E2E baseline 全部完成。KernelAgent（softmax/layernorm/transpose，2 轮）正在运行中，结果待更新。
 
 ---
 

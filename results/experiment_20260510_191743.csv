@@ -1,0 +1,2 @@
+kernel,description,baseline_ms,agent_best_ms,agent_speedup_pct,agent_success,agent_rounds,agent_elapsed_s,e2e_best_ms,e2e_speedup_pct,e2e_success,e2e_tries_ok,model,agent_rounds_cfg,agent_best_of_n_cfg
+vector_add,Vector addition 16 M elements (KernelBench L1: elementwise binary),0.6266666666666666,0.6266666666666666,0.0,False,0,0,0.6266666666666666,0.0,False,0,qwen3.5-flash-2026-02-23,3,1

@@ -1,0 +1,4 @@
+kernel,description,baseline_ms,agent_best_ms,agent_speedup_pct,agent_success,agent_rounds,agent_elapsed_s,e2e_best_ms,e2e_speedup_pct,e2e_success,e2e_tries_ok,model,agent_rounds_cfg,agent_best_of_n_cfg
+softmax,Row-wise softmax 4096×1024 (KernelBench L1: reduction),0.46,0.46,0.0,False,0,592.6618061065674,0.46,0.0,False,0,qwen3.5-flash-2026-02-23,2,1
+layernorm,Layer norm 4096×1024 (KernelBench L1: compound reduction),0.4483333333333333,0.4483333333333333,0.0,False,0,483.22578406333923,0.4483333333333333,0.0,False,0,qwen3.5-flash-2026-02-23,2,1
+transpose,4096×4096 transpose (KernelBench L1: memory pattern),0.4283333333333333,0.4283333333333333,0.0,False,0,709.1733603477478,0.4283333333333333,0.0,False,0,qwen3.5-flash-2026-02-23,2,1

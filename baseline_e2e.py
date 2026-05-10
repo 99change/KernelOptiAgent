@@ -68,7 +68,7 @@ def main():
         print("ERROR: DASHSCOPE_API_KEY not set", file=sys.stderr)
         sys.exit(1)
 
-    client = OpenAI(api_key=cfg.api_key, base_url=DASHSCOPE_BASE_URL)
+    client = OpenAI(api_key=cfg.api_key, base_url=DASHSCOPE_BASE_URL, timeout=120.0)
 
     # 先测 baseline
     print(f"[Baseline] Compiling and timing original kernel...")

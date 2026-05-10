@@ -1,0 +1,87 @@
+% main.tex
+% SingleKernelOptiAgent: Profiling-Guided CUDA Kernel Optimization via LLM Agents
+
+\documentclass[10pt,twocolumn]{article}
+
+% ── Packages ──────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+
+% ── Custom macros ─────────────────────────────────────────────────────────────
+% Placeholder for results not yet collected — renders visibly in draft
+\newcommand{\RESULTVAL}[1]{\textbf{[?]}}
+
+% ── Code listing style ────────────────────────────────────────────────────────
+\lstdefinestyle{cuda}{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue},
+  commentstyle=\color{gray},
+  stringstyle=\color{orange},
+  breaklines=true,
+  frame=single,
+}
+
+% ── Title ─────────────────────────────────────────────────────────────────────
+\title{%
+  \textbf{SingleKernelOptiAgent}:\\
+  Profiling-Guided CUDA Kernel Optimization via LLM Agents
+}
+
+\author{%
+  [Author(s)]\\
+  [Institution]\\
+  \texttt{[email]}
+}
+
+\date{\today}
+
+% ── Bibliography ──────────────────────────────────────────────────────────────
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \textbf{SingleKernelOptiAgent}, a multi-agent system for automated
+CUDA kernel optimization.
+The system combines hardware profiling (NVIDIA Nsight Compute) with LLM-driven
+code synthesis in a three-stage pipeline: a \textit{Profiler Agent} collects
+fine-grained GPU hardware counters, an \textit{Analyzer Agent} uses these
+counters to identify the dominant performance bottleneck and retrieves relevant
+optimization patterns from a knowledge base, and an \textit{Optimizer Agent}
+generates optimized CUDA code conditioned on the structured bottleneck analysis.
+We also apply test-time scaling (TTS) via a Best-of-$N$ parallel search that
+uses hardware execution time as a reward signal.
+Evaluated on a representative subset of KernelBench Level~1 — covering GEMM,
+softmax, layer normalization, matrix transpose, vector add, and ReLU —
+our system consistently outperforms a direct LLM baseline (same model, no
+profiling), achieving a \textbf{32.5\%} speedup on GEMM and comparable gains
+across other operator categories.
+These results demonstrate that hardware-grounded bottleneck analysis is an
+effective and complementary signal for LLM-driven code optimization.
+\end{abstract}
+
+% ── Sections ─────────────────────────────────────────────────────────────────
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/methodology}
+\input{sections/experiments}
+\input{sections/conclusion}
+
+% ── References ────────────────────────────────────────────────────────────────
+\bibliography{references}
+
+\end{document}
